@@ -2,6 +2,19 @@
 (function (global) {
   'use strict';
 
+  // Loudness for a volume slider position (0..1): squared for a natural curve, with the top of
+  // the slider at half of the original range (the original 100% was far too loud). Used wherever
+  // the slider turns into element volume (here, the crossfade, outside volume changes).
+  const VOLUME_CEILING = 0.5;
+  function elementVolume(slider) {
+    const v = Math.max(0, Math.min(1, Number.isFinite(slider) ? slider : 0)) * VOLUME_CEILING;
+    return v * v;
+  }
+  function sliderFromElementVolume(vol) {
+    return Math.max(0, Math.min(1, Math.sqrt(Math.max(0, vol)) / VOLUME_CEILING));
+  }
+  global.riffVolume = { elementVolume, sliderFromElementVolume };
+
   class RiffAudioEngine {
     constructor() {
       this.ctx = null;
@@ -518,8 +531,7 @@
           }
         } catch (_) {}
       }
-      const raw = this.isMuted ? 0 : Math.max(0, Math.min(1, Number.isFinite(this.volume) ? this.volume : 0.85));
-      const vol = raw * raw;
+      const vol = this.isMuted ? 0 : elementVolume(Number.isFinite(this.volume) ? this.volume : 0.85);
       this.appliedElementVolume = vol;
       if (this._attachedElement) {
         try {

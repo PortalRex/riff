@@ -4440,7 +4440,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       cfTailAudio = new Audio();
       cfTailAudio.crossOrigin = 'anonymous';
     }
-    const startVol = state.isMuted ? 0 : Math.max(0, Math.min(1, state.volume * state.volume * (state.audioSettings?.volume || 1)));
+    const startVol = state.isMuted ? 0 : Math.max(0, Math.min(1, window.riffVolume.elementVolume(state.volume) * (state.audioSettings?.volume || 1)));
     if (startVol <= 0.01) return;
     try {
       cfTailAudio.src = src;
@@ -8504,9 +8504,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (audioEngine && Number.isFinite(audioEngine.appliedElementVolume) &&
           Math.abs(el.nativeAudio.volume - audioEngine.appliedElementVolume) < 0.005) return;
-      if (extMuted !== state.isMuted || (!extMuted && Math.abs(extVol - state.volume * state.volume) > 0.015)) {
+      if (extMuted !== state.isMuted || (!extMuted && Math.abs(extVol - window.riffVolume.elementVolume(state.volume)) > 0.015)) {
         state.isMuted = extMuted;
-        if (!extMuted) state.volume = Math.sqrt(extVol);
+        if (!extMuted) state.volume = window.riffVolume.sliderFromElementVolume(extVol);
         if (el.volumeSlider) el.volumeSlider.value = String(state.volume);
         if (el.volumeIcon) el.volumeIcon.classList.toggle('hidden', state.isMuted);
         if (el.volumeMutedIcon) el.volumeMutedIcon.classList.toggle('hidden', !state.isMuted);
