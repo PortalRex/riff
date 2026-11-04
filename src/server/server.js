@@ -5869,6 +5869,7 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/spotify-logout',
   '/api/prefetch',
   '/api/prefetch-stream',
+  '/api/fork-settings',
   '/api/check-cache',
   '/api/stream-info',
   '/api/track-analysis',
@@ -6062,6 +6063,31 @@ function remoteTokenMatches(provided) {
   return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
+// GET lists the fork settings, POST {key, value} changes one. Used by the remote API (Flow plugin)
+// and by the window's Settings > Storage (/api/fork-settings).
+function handleForkSettings(req, res) {
+  const send = (code, payload) => {
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+  };
+  if (req.method === 'GET') {
+    const settings = Object.entries(FORK_SETTINGS).map(([key, spec]) => ({
+      key, label: spec.label, description: spec.description, type: typeof spec.default, default: spec.default, value: forkSetting(key)
+    }));
+    return send(200, { success: true, settings });
+  }
+  if (req.method !== 'POST') return send(405, { success: false, error: 'GET or POST' });
+  let body = '';
+  req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
+  req.on('end', () => {
+    const change = safeJsonParse(body, null);
+    if (!change || !setForkSetting(change.key, change.value)) return send(400, { success: false, error: 'unknown setting or bad value' });
+    if (change.key === 'keepPlaylistsDownloaded' && change.value) syncPlaylistDownloads().catch(() => {});
+    if (change.key === 'cacheLimitGB') pruneDiskCache();
+    return send(200, { success: true, key: change.key, value: forkSetting(change.key) });
+  });
+}
+
 function handleRemoteRoute(req, res, parsedUrl) {
   const send = (code, payload) => {
     res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -6071,24 +6097,7 @@ function handleRemoteRoute(req, res, parsedUrl) {
   const route = parsedUrl.pathname.slice('/api/remote/'.length);
   const query = parsedUrl.query || {};
 
-  if (route === 'settings' && req.method === 'GET') {
-    const settings = Object.entries(FORK_SETTINGS).map(([key, spec]) => ({
-      key, label: spec.label, description: spec.description, type: typeof spec.default, default: spec.default, value: forkSetting(key)
-    }));
-    return send(200, { success: true, settings });
-  }
-  if (route === 'settings' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
-    req.on('end', () => {
-      const change = safeJsonParse(body, null);
-      if (!change || !setForkSetting(change.key, change.value)) return send(400, { success: false, error: 'unknown setting or bad value' });
-      if (change.key === 'keepPlaylistsDownloaded' && change.value) syncPlaylistDownloads().catch(() => {});
-      if (change.key === 'cacheLimitGB') pruneDiskCache();
-      return send(200, { success: true, key: change.key, value: forkSetting(change.key) });
-    });
-    return;
-  }
+  if (route === 'settings') return handleForkSettings(req, res);
   if (route === 'state' && req.method === 'GET') {
     return send(200, { success: true, state: remoteState, now: Date.now() });
   }
@@ -9251,6 +9260,8 @@ async function requestHandler(req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: true, artist: info }));
   }
+
+  if (parsedUrl.pathname === '/api/fork-settings') return handleForkSettings(req, res);
 
   if (parsedUrl.pathname === '/api/prefetch-stream' && req.method === 'POST') {
     // The window's own search results: start fetching the likeliest picks (see queueRemotePrefetch).

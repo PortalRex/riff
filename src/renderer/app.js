@@ -17223,6 +17223,85 @@ function bindCoverHoldZoom(wrapEl) {
   updateTvkVisualizerLyricsSetting(localStorage.getItem('riff_tvk_visualizer_lyrics') !== 'false');
   updateTvkVisualizerOpacity(parseInt(localStorage.getItem('riff_tvk_visualizer_opacity') || '85', 10));
 
+  // The fork's switches in Settings > Storage. They live in the server (fork-settings.json) and the
+  // Flow plugin changes them too, so the rows are rebuilt from the server whenever the window shows.
+  async function saveForkSetting(key, value) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/fork-settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, value })
+      });
+      return res.ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function renderForkSettings() {
+    const group = document.getElementById('fork-settings-group');
+    if (!group) return;
+    let settings;
+    try {
+      settings = (await (await fetch(`http://127.0.0.1:${state.serverPort}/api/fork-settings`)).json()).settings;
+    } catch (_) {
+      return;
+    }
+    if (!Array.isArray(settings)) return;
+    group.innerHTML = '';
+    for (const s of settings) {
+      const item = document.createElement('div');
+      item.className = 'setting-item';
+      const top = document.createElement('div');
+      top.className = 'setting-item-top';
+      top.style.alignItems = 'center';
+      const text = document.createElement('div');
+      text.style.cssText = 'display: flex; flex-direction: column; gap: 2px;';
+      const name = document.createElement('span');
+      name.className = 'setting-name';
+      name.textContent = s.label;
+      const desc = document.createElement('span');
+      desc.style.cssText = 'font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);';
+      desc.textContent = s.description;
+      text.append(name, desc);
+      top.appendChild(text);
+      item.appendChild(top);
+      if (s.type === 'boolean') {
+        const btn = document.createElement('button');
+        btn.className = 'effect-switch-btn' + (s.value ? ' active' : '');
+        btn.innerHTML = '<span class="thumb"></span>';
+        btn.addEventListener('click', async () => {
+          const next = !btn.classList.contains('active');
+          if (await saveForkSetting(s.key, next)) btn.classList.toggle('active', next);
+        });
+        top.appendChild(btn);
+      } else if (s.key === 'cacheLimitGB') {
+        const val = document.createElement('span');
+        val.className = 'setting-val';
+        val.style.cssText = 'font-size: calc(13px * var(--font-scale, 1)); font-weight: 500; min-width: 52px; text-align: right;';
+        val.textContent = `${s.value} GB`;
+        top.appendChild(val);
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.className = 'pill-range';
+        slider.min = '1';
+        slider.max = String(Math.max(100, s.value));
+        slider.step = '1';
+        slider.value = String(s.value);
+        slider.style.cssText = 'width: 100%; margin-top: 8px;';
+        slider.addEventListener('input', () => { val.textContent = `${slider.value} GB`; });
+        slider.addEventListener('change', async () => {
+          if (!(await saveForkSetting(s.key, Number(slider.value)))) { slider.value = String(s.value); val.textContent = `${s.value} GB`; }
+          else s.value = Number(slider.value);
+        });
+        item.style.flexDirection = 'column';
+        item.style.alignItems = 'stretch';
+        item.appendChild(slider);
+      }
+      group.appendChild(item);
+    }
+  }
+  renderForkSettings();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) renderForkSettings(); });
+
   const btnPerfMode = document.getElementById('btn-perf-mode');
   const initialPerfMode = localStorage.getItem('riff_perf_mode') === '1';
   applyPerfMode(initialPerfMode);
