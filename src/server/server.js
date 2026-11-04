@@ -432,10 +432,14 @@ function findCachedFileByMeta(title, artist) {
   return null;
 }
 
+// The most cached songs may take up (RIFF_CACHE_LIMIT_GB overrides the 10 GB default).
+const CACHE_LIMIT_BYTES = (parseFloat(process.env.RIFF_CACHE_LIMIT_GB) || 10) * 1024 ** 3;
+
 async function pruneDiskCache() {
   try {
     const files = await fs.promises.readdir(CACHE_DIR);
     const now = Date.now();
+    const songs = [];
     for (const file of files) {
       const fullPath = path.join(CACHE_DIR, file);
       try {
@@ -450,6 +454,18 @@ async function pruneDiskCache() {
           await fs.promises.unlink(fullPath);
           continue;
         }
+        if (/\.(opus|webm|m4a|mp3)$/i.test(file)) songs.push({ fullPath, size: stat.size, used: stat.mtimeMs });
+      } catch (e) {}
+    }
+    // Keep the cache under its limit by removing the songs played longest ago (findCachedFile
+    // touches a song's time each time it is played).
+    let total = songs.reduce((sum, s) => sum + s.size, 0);
+    songs.sort((a, b) => a.used - b.used);
+    for (const song of songs) {
+      if (total <= CACHE_LIMIT_BYTES) break;
+      try {
+        await fs.promises.unlink(song.fullPath);
+        total -= song.size;
       } catch (e) {}
     }
   } catch (e) {
@@ -458,6 +474,7 @@ async function pruneDiskCache() {
 }
 
 pruneDiskCache();
+setInterval(pruneDiskCache, 30 * 60 * 1000).unref();
 
 function parseDurationSeconds(str) {
   if (!str) return 0;
@@ -2411,13 +2428,15 @@ async function ytmSearchRequest(query, params = YTM_SONGS_PARAMS, attempt = 0, t
       agent: attempt === 0 ? keepAliveHttpsAgent : false,
       family: 4,
       timeout: timeoutMs,
-      headers: {
+      // Signed in with the user's YouTube cookies when there are any: YouTube Music refuses (403)
+      // many anonymous searches, which sent Riff to plain YouTube search and its video results.
+      headers: Object.assign({
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
         'Origin': 'https://music.youtube.com',
         'Referer': 'https://music.youtube.com/',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-      }
+      }, getYtAuthHeaders('https://music.youtube.com') || {})
     }, (res) => {
       if (res.statusCode < 200 || res.statusCode >= 300) {
         try { logger.log('warn', `ytmusic search status ${res.statusCode}`); } catch (_) {}
@@ -2706,9 +2725,10 @@ async function fetchMetadataSearchFallback(query, limit = 24) {
   return [];
 }
 
-// When YouTube Music refuses the search (it has been answering 403), every lookup waited on the
-// refusal and its retries before falling back. After a failure the search is skipped for a while.
-const YTM_SEARCH_COOLDOWN_MS = 10 * 60 * 1000;
+// When YouTube Music refuses the search (it answers 403 now and then), every lookup waited on the
+// refusal and its retries before falling back. After a failure the search is skipped briefly;
+// the refusals come and go, so the pause is short (plain YouTube results are a worse fallback).
+const YTM_SEARCH_COOLDOWN_MS = 2 * 60 * 1000;
 let ytmSearchBlockedUntil = 0;
 
 async function ytmusicSearch(query, options = {}) {

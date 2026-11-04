@@ -39,6 +39,17 @@ function initUpdater(getWindow) {
   try { ipcMain.removeHandler('get-app-version'); } catch (_) {}
   ipcMain.handle('get-app-version', () => app.getVersion());
 
+  // This is the PortalRex fork. An update from rootscripts/riff would replace it and drop the
+  // fork's changes, so it never checks for, downloads or installs updates; "Check for updates"
+  // just answers that there is none.
+  try { ipcMain.removeHandler('update-check'); } catch (_) {}
+  ipcMain.handle('update-check', () => {
+    const win = getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('update-not-available', { version: app.getVersion() });
+    return { ok: true };
+  });
+  return;
+
   const isDev = !app.isPackaged;
   const devConfigFile = path.join(__dirname, '../../dev-app-update.yml');
   const canInstall = !isDev && (process.platform === 'win32' || (process.platform === 'linux' && !!process.env.APPIMAGE));
