@@ -18336,7 +18336,10 @@ function bindCoverHoldZoom(wrapEl) {
         break;
       }
       case 'playList': {
-        const source = remoteListTracks(command.kind, command.id);
+        // kind 'tracks' plays a list the caller sends, such as an album's songs.
+        const source = command.kind === 'tracks' && Array.isArray(command.tracks)
+          ? command.tracks.map(remoteTrack).filter(Boolean)
+          : remoteListTracks(command.kind, command.id);
         if (!Array.isArray(source) || source.length === 0) break;
         const tracks = source.slice();
         let index = Number.isInteger(command.index) ? Math.max(0, Math.min(tracks.length - 1, command.index)) : 0;
