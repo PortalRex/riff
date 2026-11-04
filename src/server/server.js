@@ -5990,6 +5990,46 @@ function pinnedCacheIds(tracks) {
   return ids;
 }
 
+// What the playlist sync is doing, for the progress shown in Settings and the Flow plugin.
+const playlistSyncProgress = { running: false, queued: 0, done: 0, failed: 0, current: null, startedAt: 0 };
+let playlistStatusCache = { at: 0, value: null };
+
+// How much of the library is downloaded, and the running sync's progress. The library count
+// checks every song's file, so it is reused for a few seconds.
+function playlistSyncStatus() {
+  if (Date.now() - playlistStatusCache.at > 3000) {
+    const tracks = playlistTracks();
+    let songs = 0;
+    let downloaded = 0;
+    if (tracks) {
+      const cachedByKey = new Map();
+      for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
+        if (meta && meta.title) cachedByKey.set(trackKey(meta.artist, meta.title), cid);
+      }
+      const seen = new Set();
+      for (const t of tracks) {
+        const key = trackKey(t.artist, t.title);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        songs++;
+        if (hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(key))) downloaded++;
+      }
+    }
+    playlistStatusCache = { at: Date.now(), value: { songs, downloaded } };
+  }
+  const p = playlistSyncProgress;
+  const perSong = p.done > 0 ? (Date.now() - p.startedAt) / p.done : 10000;
+  return Object.assign({}, playlistStatusCache.value, {
+    enabled: !!forkSetting('keepPlaylistsDownloaded'),
+    running: p.running,
+    queued: p.queued,
+    done: p.done,
+    failed: p.failed,
+    current: p.current,
+    secondsLeft: p.running ? Math.round(((p.queued - p.done) * perSong) / 1000) : 0
+  });
+}
+
 async function syncPlaylistDownloads() {
   if (playlistSyncRunning || !forkSetting('keepPlaylistsDownloaded')) return;
   const tracks = playlistTracks();
@@ -6012,16 +6052,22 @@ async function syncPlaylistDownloads() {
       if (!isCached(t)) missing.push(t);
     }
     if (missing.length) try { logger.log('info', `playlist sync: fetching ${missing.length} songs`); } catch (_) {}
+    Object.assign(playlistSyncProgress, { running: missing.length > 0, queued: missing.length, done: 0, failed: 0, current: null, startedAt: Date.now() });
     for (const t of missing) {
       if (!forkSetting('keepPlaylistsDownloaded')) break; // switched off part-way
+      playlistSyncProgress.current = { title: t.title, artist: t.artist || '' };
       await fetchTrackInBackground(t);
       const ok = hasCachedAudio(cleanTrackId(t.id || '')) || !!findCachedFileByMeta(t.title, t.artist);
       if (ok) playlistSyncFailed.delete(trackKey(t.artist, t.title));
-      else playlistSyncFailed.set(trackKey(t.artist, t.title), Date.now());
+      else { playlistSyncFailed.set(trackKey(t.artist, t.title), Date.now()); playlistSyncProgress.failed++; }
+      playlistSyncProgress.done++;
+      playlistStatusCache.at = 0; // the downloaded count changed
       await new Promise(r => setTimeout(r, 2000)); // gently, one song at a time
     }
   } finally {
     playlistSyncRunning = false;
+    Object.assign(playlistSyncProgress, { running: false, current: null });
+    playlistStatusCache.at = 0;
   }
 }
 
@@ -6074,7 +6120,7 @@ function handleForkSettings(req, res) {
     const settings = Object.entries(FORK_SETTINGS).map(([key, spec]) => ({
       key, label: spec.label, description: spec.description, type: typeof spec.default, default: spec.default, value: forkSetting(key)
     }));
-    return send(200, { success: true, settings });
+    return send(200, { success: true, settings, playlistSync: playlistSyncStatus() });
   }
   if (req.method !== 'POST') return send(405, { success: false, error: 'GET or POST' });
   let body = '';

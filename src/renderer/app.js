@@ -17236,12 +17236,42 @@ function bindCoverHoldZoom(wrapEl) {
     }
   }
 
+  function formatTimeLeft(seconds) {
+    if (seconds < 90) return 'a minute';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} min`;
+    return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  }
+
+  // The line and bar under "Keep playlist songs downloaded".
+  function showPlaylistSyncProgress(status) {
+    const text = document.getElementById('fork-sync-text');
+    const bar = document.getElementById('fork-sync-bar');
+    if (!text || !bar || !status) return;
+    const { songs, downloaded, enabled, running, current, secondsLeft, failed } = status;
+    let line;
+    if (!songs) line = 'No songs in your playlists or liked songs yet';
+    else if (running) {
+      line = `${downloaded} of ${songs} downloaded`;
+      if (current) line += ` · now: ${current.title}${current.artist ? ' — ' + current.artist : ''}`;
+      if (secondsLeft > 0) line += ` · about ${formatTimeLeft(secondsLeft)} left`;
+      if (failed > 0) line += ` · ${failed} not found`;
+    } else if (enabled) {
+      line = downloaded >= songs ? `All ${songs} songs downloaded` : `${downloaded} of ${songs} downloaded · the rest start within 10 minutes`;
+    } else {
+      line = `${downloaded} of ${songs} downloaded · turn on to download the rest`;
+    }
+    text.textContent = line;
+    bar.style.width = songs ? `${Math.round((downloaded / songs) * 100)}%` : '0%';
+  }
+
   async function renderForkSettings() {
     const group = document.getElementById('fork-settings-group');
     if (!group) return;
     let settings;
+    let playlistSync;
     try {
-      settings = (await (await fetch(`http://127.0.0.1:${state.serverPort}/api/fork-settings`)).json()).settings;
+      ({ settings, playlistSync } = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/fork-settings`)).json());
     } catch (_) {
       return;
     }
@@ -17273,6 +17303,17 @@ function bindCoverHoldZoom(wrapEl) {
           if (await saveForkSetting(s.key, next)) btn.classList.toggle('active', next);
         });
         top.appendChild(btn);
+        if (s.key === 'keepPlaylistsDownloaded') {
+          const progress = document.createElement('div');
+          progress.style.cssText = 'margin-top: 10px;';
+          progress.innerHTML =
+            '<div style="height: 4px; border-radius: 2px; background: var(--md-sys-color-surface-container-high); overflow: hidden;">' +
+            '<div id="fork-sync-bar" style="height: 100%; width: 0%; background: var(--md-sys-color-primary); transition: width 0.4s;"></div></div>' +
+            '<div id="fork-sync-text" style="margin-top: 6px; font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);"></div>';
+          item.style.flexDirection = 'column';
+          item.style.alignItems = 'stretch';
+          item.appendChild(progress);
+        }
       } else if (s.key === 'cacheLimitGB') {
         const val = document.createElement('span');
         val.className = 'setting-val';
@@ -17298,9 +17339,19 @@ function bindCoverHoldZoom(wrapEl) {
       }
       group.appendChild(item);
     }
+    showPlaylistSyncProgress(playlistSync);
   }
   renderForkSettings();
   document.addEventListener('visibilitychange', () => { if (!document.hidden) renderForkSettings(); });
+  // Refresh the download progress every couple of seconds, only while it is on screen.
+  setInterval(async () => {
+    const text = document.getElementById('fork-sync-text');
+    if (!text || document.hidden || text.offsetParent === null) return;
+    try {
+      const { playlistSync } = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/fork-settings`)).json();
+      showPlaylistSyncProgress(playlistSync);
+    } catch (_) {}
+  }, 2000);
 
   const btnPerfMode = document.getElementById('btn-perf-mode');
   const initialPerfMode = localStorage.getItem('riff_perf_mode') === '1';
