@@ -18203,6 +18203,151 @@ function bindCoverHoldZoom(wrapEl) {
       else if (action === 'volume-down') adjustVolume(-0.05);
     });
   }
+
+  // Remote control (see /api/remote/ in server.js): commands from other programs on this PC,
+  // and a compact player state published back for them.
+  function remoteTrack(raw) {
+    if (!raw || typeof raw !== 'object' || !raw.title) return null;
+    const track = {};
+    for (const key of ['id', 'title', 'artist', 'album', 'duration', 'thumbnail', 'cover', 'url', 'platform', 'searchQuery', 'isExplicit']) {
+      if (raw[key] !== undefined && raw[key] !== null) track[key] = raw[key];
+    }
+    if (!track.id) track.id = 'cand_' + Math.random().toString(36).slice(2, 10);
+    if (!track.platform) track.platform = state.platform || 'ytmusic';
+    return track;
+  }
+
+  function remoteListTracks(kind, id) {
+    if (kind === 'liked') return state.favorites;
+    if (kind === 'history') return state.history;
+    if (kind === 'playlist') {
+      const playlist = state.playlists.find(p => p.id === id);
+      return playlist ? playlist.tracks : null;
+    }
+    return null;
+  }
+
+  function handleRemoteCommand(command) {
+    if (!command || typeof command !== 'object') return;
+    const audio = (state.secondaryAudio && !state.secondaryAudio.paused) ? state.secondaryAudio : el.nativeAudio;
+    switch (command.action) {
+      case 'toggle': togglePlayPause(); break;
+      case 'play': if (!state.isPlaying) playSmooth(); break;
+      case 'pause': if (state.isPlaying) pauseSmooth(); break;
+      case 'next': playNext(); break;
+      case 'prev': playPrev(); break;
+      case 'seek': {
+        if (!audio || !Number.isFinite(audio.duration)) break;
+        const target = Number.isFinite(command.seconds) ? command.seconds
+          : Number.isFinite(command.delta) ? audio.currentTime + command.delta : NaN;
+        if (!Number.isFinite(target)) break;
+        audio.currentTime = Math.max(0, Math.min(audio.duration - 0.5, target));
+        if (typeof updateSyncedLyricsHighlight === 'function') updateSyncedLyricsHighlight(audio.currentTime);
+        updateMediaPositionState();
+        break;
+      }
+      case 'volume': {
+        const target = Number.isFinite(command.value) ? command.value / 100
+          : Number.isFinite(command.delta) ? state.volume + command.delta / 100 : NaN;
+        if (Number.isFinite(target)) adjustVolume(Math.max(0, Math.min(1, target)) - state.volume);
+        break;
+      }
+      case 'mute': if (el.btnVolumeMute) el.btnVolumeMute.click(); break;
+      case 'shuffle':
+        if (typeof command.on !== 'boolean' || command.on !== state.isShuffle) window.toggleShuffle();
+        break;
+      case 'repeat':
+        if (typeof command.on !== 'boolean' || command.on !== state.isRepeat) window.toggleRepeat();
+        break;
+      case 'like': {
+        const track = command.track ? remoteTrack(command.track) : state.currentTrack;
+        if (!track) break;
+        const liked = isTrackFavorited(track);
+        if (typeof command.on !== 'boolean' || command.on !== liked) toggleFavoriteTrack(track);
+        break;
+      }
+      case 'playTrack': {
+        const track = remoteTrack(command.track);
+        if (track) playTrack(track, [track], 0, 'search');
+        break;
+      }
+      case 'queueTrack': {
+        const track = remoteTrack(command.track);
+        if (track) addTrackToQueue(track);
+        break;
+      }
+      case 'playNextTrack': {
+        const track = remoteTrack(command.track);
+        if (!track) break;
+        if (!state.currentTrack || state.queue.length === 0) { addTrackToQueue(track); break; }
+        state.queue.splice(state.queueIndex + 1, 0, track);
+        updateQueueBadge();
+        if (state.currentView === 'queue') renderQueueView();
+        showToast(typeof t === 'function' ? t('Playing next') : 'Playing next', 'success');
+        break;
+      }
+      case 'playList': {
+        const source = remoteListTracks(command.kind, command.id);
+        if (!Array.isArray(source) || source.length === 0) break;
+        const tracks = source.slice();
+        let index = Number.isInteger(command.index) ? Math.max(0, Math.min(tracks.length - 1, command.index)) : 0;
+        if (command.shuffle) {
+          for (let i = tracks.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+          }
+          index = 0;
+        }
+        playTrack(tracks[index], tracks, index, command.kind === 'playlist' ? 'playlist' : command.kind);
+        break;
+      }
+      case 'playQueueIndex': {
+        const index = command.index;
+        if (Number.isInteger(index) && index >= 0 && index < state.queue.length) playTrack(state.queue[index], index);
+        break;
+      }
+    }
+    publishRemoteState(true);
+  }
+
+  if (window.electronAPI && window.electronAPI.onRemoteCommand) {
+    window.electronAPI.onRemoteCommand(handleRemoteCommand);
+  }
+
+  let lastRemoteStateKey = '';
+  let lastRemoteStateAt = 0;
+  function publishRemoteState(force = false) {
+    if (!window.electronAPI || !window.electronAPI.sendRemoteState) return;
+    const audio = (state.secondaryAudio && !state.secondaryAudio.paused) ? state.secondaryAudio : el.nativeAudio;
+    const track = state.currentTrack;
+    const brief = (t) => t ? { id: t.id, title: t.title, artist: t.artist, duration: t.duration || 0, thumbnail: t.thumbnail || t.cover || '' } : null;
+    const queueStart = Math.max(0, state.queueIndex - 5);
+    const snapshot = {
+      track: brief(track),
+      liked: track ? isTrackFavorited(track) : false,
+      isPlaying: !!state.isPlaying,
+      isLoading: !!state.isLoadingTrack,
+      position: (audio && Number.isFinite(audio.currentTime)) ? audio.currentTime : 0,
+      duration: (audio && Number.isFinite(audio.duration) && audio.duration > 0) ? audio.duration : (track && track.duration) || 0,
+      volume: Math.round(state.volume * 100),
+      muted: !!state.isMuted,
+      shuffle: !!state.isShuffle,
+      repeat: !!state.isRepeat,
+      queueIndex: state.queueIndex,
+      queueLength: state.queue.length,
+      queueStart,
+      queue: state.queue.slice(queueStart, queueStart + 60).map(brief)
+    };
+    const key = JSON.stringify([snapshot.track && snapshot.track.id, snapshot.liked, snapshot.isPlaying, snapshot.isLoading,
+      snapshot.volume, snapshot.muted, snapshot.shuffle, snapshot.repeat, snapshot.queueIndex, snapshot.queueLength]);
+    const now = Date.now();
+    if (!force && key === lastRemoteStateKey && now - lastRemoteStateAt < 5000) return;
+    lastRemoteStateKey = key;
+    lastRemoteStateAt = now;
+    window.electronAPI.sendRemoteState(snapshot);
+  }
+  setInterval(publishRemoteState, 1000);
+
   function applyWelcomeResult(d) {
     if (!d) return;
     function setSwitch(btn, on) { if (btn && btn.classList.contains('active') !== !!on) btn.click(); }

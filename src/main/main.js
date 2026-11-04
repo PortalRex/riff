@@ -146,7 +146,7 @@ if (process.argv.includes('lyrics') || process.argv.includes('--lyrics')) {
 }
 
 function runGUI() {
-  const { startServer, PORT, getServerToken } = require('../server/server');
+  const { startServer, PORT, getServerToken, setRemoteHandlers, setRemoteState } = require('../server/server');
   const discordRPC = require('./discord');
 
   let mainWindow = null;
@@ -366,6 +366,55 @@ function runGUI() {
       console.warn('Failed to persist window state:', error);
     }
   }
+
+  // Library lists for the remote API, read from the renderer's saved storage so they are always
+  // current without the window having to send them.
+  function remoteLibrary(kind, id) {
+    const store = latestStorageSnapshot || readStorageDiskSync() || {};
+    const list = (key) => {
+      try {
+        const parsed = JSON.parse(store[key] || '[]');
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (_) {
+        return [];
+      }
+    };
+    const slim = (t) => ({
+      id: t.id, title: t.title, artist: t.artist, duration: t.duration || 0,
+      thumbnail: t.thumbnail || t.cover || '', url: t.url || '', platform: t.platform || ''
+    });
+    if (kind === 'playlists') {
+      return {
+        playlists: list('devsize_playlists').map(p => ({
+          id: p.id, name: p.name, count: Array.isArray(p.tracks) ? p.tracks.length : 0,
+          thumbnail: (Array.isArray(p.tracks) && p.tracks.find(t => t && (t.thumbnail || t.cover)) || {}).thumbnail || ''
+        }))
+      };
+    }
+    if (kind === 'playlist') {
+      const playlist = list('devsize_playlists').find(p => p.id === id);
+      return playlist ? { name: playlist.name, tracks: (playlist.tracks || []).map(slim) } : null;
+    }
+    if (kind === 'liked') return { name: 'Liked songs', tracks: list('devsize_favorites').map(slim) };
+    if (kind === 'history') return { name: 'History', tracks: list('devsize_history').map(slim) };
+    return null;
+  }
+
+  setRemoteHandlers({
+    library: remoteLibrary,
+    command: (command) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      if (command.action === 'show') {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+        return true;
+      }
+      mainWindow.webContents.send('remote-command', command);
+      return true;
+    }
+  });
+  ipcMain.on('remote-state', (event, state) => setRemoteState(state));
 
   async function createWindow() {
     serverPort = await startServer(PORT);

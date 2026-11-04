@@ -72,6 +72,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setMultiInstance: (v) => ipcRenderer.send('set-multi-instance', v),
   onMediaCommand: (cb) => ipcRenderer.on('media-command', (e, cmd) => cb(cmd)),
   onMediaControl: (cb) => ipcRenderer.on('media-control', (e, action) => cb(action)),
+  onRemoteCommand: (cb) => ipcRenderer.on('remote-command', (e, command) => cb(command)),
+  sendRemoteState: (state) => ipcRenderer.send('remote-state', state),
   toggleMiniWindow: () => ipcRenderer.invoke('toggle-mini-window'),
   setMiniLyrics: (enabled) => ipcRenderer.invoke('set-mini-lyrics', enabled),
   isWindows: process.platform === 'win32',

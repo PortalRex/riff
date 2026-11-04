@@ -5489,6 +5489,86 @@ function getServerToken() {
   return SERVER_TOKEN;
 }
 
+// Remote control for other programs on this PC, such as a launcher plugin. They read the port
+// and a per-run token from remote.json in the data folder and send the token on every
+// /api/remote/ request. The main process supplies the player state, the library and a way to
+// pass commands to the window (setRemoteHandlers / setRemoteState).
+const REMOTE_TOKEN = crypto.randomBytes(24).toString('hex');
+const REMOTE_INFO_PATH = path.join(DATA_DIR, 'remote.json');
+const REMOTE_ACTIONS = new Set([
+  'toggle', 'play', 'pause', 'next', 'prev', 'seek', 'volume', 'mute', 'shuffle', 'repeat', 'like',
+  'playTrack', 'queueTrack', 'playNextTrack', 'playList', 'playQueueIndex', 'show'
+]);
+let remoteState = null;
+let remoteHandlers = { command: null, library: null };
+
+function setRemoteHandlers(handlers) {
+  remoteHandlers = Object.assign({}, remoteHandlers, handlers);
+}
+
+function setRemoteState(state) {
+  if (state && typeof state === 'object') remoteState = Object.assign({}, state, { receivedAt: Date.now() });
+}
+
+function writeRemoteInfo(port) {
+  try {
+    fs.writeFileSync(REMOTE_INFO_PATH, JSON.stringify({ port, token: REMOTE_TOKEN, pid: process.pid }), { mode: 0o600 });
+  } catch (_) {}
+}
+
+function removeRemoteInfo() {
+  try {
+    const current = JSON.parse(fs.readFileSync(REMOTE_INFO_PATH, 'utf8'));
+    if (current && current.token === REMOTE_TOKEN) fs.unlinkSync(REMOTE_INFO_PATH);
+  } catch (_) {}
+}
+
+function remoteTokenMatches(provided) {
+  if (typeof provided !== 'string') return false;
+  const expected = Buffer.from(REMOTE_TOKEN);
+  const given = Buffer.from(provided);
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function handleRemoteRoute(req, res, parsedUrl) {
+  const send = (code, payload) => {
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+  };
+  if (!remoteTokenMatches(req.headers['x-riff-remote'])) return send(403, { success: false, error: 'forbidden' });
+  const route = parsedUrl.pathname.slice('/api/remote/'.length);
+  const query = parsedUrl.query || {};
+
+  if (route === 'state' && req.method === 'GET') {
+    return send(200, { success: true, state: remoteState, now: Date.now() });
+  }
+  if (route === 'library' && req.method === 'GET') {
+    const data = remoteHandlers.library ? remoteHandlers.library(String(query.kind || ''), String(query.id || '')) : null;
+    return data ? send(200, Object.assign({ success: true }, data)) : send(404, { success: false, error: 'not found' });
+  }
+  if (route === 'search' && req.method === 'GET') {
+    const limit = Math.max(1, Math.min(30, parseInt(query.limit || '12', 10) || 12));
+    return handleSearch(req, res, String(query.q || ''), String(query.platform || 'ytmusic'), limit, 0);
+  }
+  if (route === 'command' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => {
+      if (res.writableEnded) return;
+      body += chunk;
+      if (body.length > MAX_BODY_BYTES) { body = ''; req.removeAllListeners('data'); req.removeAllListeners('end'); send(413, { success: false, error: 'payload too large' }); req.resume(); }
+    });
+    req.on('end', () => {
+      if (res.writableEnded) return;
+      const command = safeJsonParse(body, null);
+      if (!command || !REMOTE_ACTIONS.has(command.action)) return send(400, { success: false, error: 'unknown action' });
+      const delivered = remoteHandlers.command ? remoteHandlers.command(command) : false;
+      return delivered ? send(200, { success: true }) : send(503, { success: false, error: 'Riff window is not ready' });
+    });
+    return;
+  }
+  return send(404, { success: false, error: 'not found' });
+}
+
 function tokenMatches(provided) {
   if (typeof provided !== 'string') return false;
   const expected = Buffer.from(SERVER_TOKEN);
@@ -8208,6 +8288,7 @@ async function requestHandler(req, res) {
   const pathname = parsedUrl.pathname;
 
   if (pathname.startsWith('/api/lastfm/')) { handleLastFmRoute(req, res, pathname); return; }
+  if (pathname.startsWith('/api/remote/')) { handleRemoteRoute(req, res, parsedUrl); return; }
 
   if (TOKEN_PROTECTED_ROUTES.has(parsedUrl.pathname) && !tokenMatches(req.headers['x-riff-token'])) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -8992,6 +9073,7 @@ function startServer(port = PORT) {
       try { logger.log('info', `server.js build fix9 listening on ${p} (ACTIVE_PORT)`); } catch (_) {}
       console.log(`devsize internal server running on http://127.0.0.1:${p}`);
       require('./tools').updateYtDlpIfManaged().catch(() => {});
+      writeRemoteInfo(p);
       resolve(p);
     }).on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
@@ -9001,6 +9083,7 @@ function startServer(port = PORT) {
           try { logger.log('warn', `server.js build fix9: port ${PORT} busy, fallback to ${p}`); } catch (_) {}
           console.log(`devsize internal server running on fallback port http://127.0.0.1:${p}`);
           require('./tools').updateYtDlpIfManaged().catch(() => {});
+          writeRemoteInfo(p);
           resolve(p);
         });
       } else {
@@ -9010,7 +9093,10 @@ function startServer(port = PORT) {
   });
 }
 
+process.on('exit', removeRemoteInfo);
+
 function stopServer() {
+  removeRemoteInfo();
   if (!server.listening) return Promise.resolve();
   return new Promise((resolve, reject) => {
     server.close((error) => {
@@ -9020,7 +9106,7 @@ function stopServer() {
   });
 }
 
-module.exports = { startServer, stopServer, PORT, getServerToken, fetchLyricsDirect, fetchLrcLib, fetchGeniusLyrics, fetchNetEaseWords, fetchKugouLyrics, fetchMusixmatchLyrics, fetchNeteaseLyrics, fetchSoundCloudSearch, ytmusicSearch, parseYrc, cleanSearchResults };
+module.exports = { startServer, stopServer, PORT, getServerToken, setRemoteHandlers, setRemoteState, fetchLyricsDirect, fetchLrcLib, fetchGeniusLyrics, fetchNetEaseWords, fetchKugouLyrics, fetchMusixmatchLyrics, fetchNeteaseLyrics, fetchSoundCloudSearch, ytmusicSearch, parseYrc, cleanSearchResults };
 
 if (require.main === module) {
   startServer();
