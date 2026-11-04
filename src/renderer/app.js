@@ -4337,11 +4337,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     fetch(streamUrl, { headers: { 'Range': 'bytes=0-262143' } }).catch(() => {});
   }
 
-  // Shuffle picks its next song when the current one starts rather than when Next is pressed,
-  // so that song can be preloaded like the next song in an unshuffled queue.
-  function pickShuffleIndex() {
+  // Shuffle plans its next few songs when the current one starts rather than picking at random
+  // when Next is pressed, so those songs can be preloaded like the next ones in an unshuffled queue.
+  const PRELOAD_AHEAD = 3;
+
+  function pickShuffleIndex(exclude) {
     const eligible = state.queue.map((track, index) => index)
-      .filter(index => index !== state.queueIndex && !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
+      .filter(index => index !== state.queueIndex && !exclude.has(index) && !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
     if (eligible.length === 0) return -1;
     const recent = new Set(state.queueHistory.slice(-Math.max(1, Math.floor(eligible.length / 2))));
     const pool = eligible.filter(index => !recent.has(index));
@@ -4349,23 +4351,47 @@ document.addEventListener('DOMContentLoaded', async () => {
     return candidates[Math.floor(Math.random() * candidates.length)];
   }
 
-  function plannedShuffleIndex() {
-    const plan = state.shufflePlan;
-    if (plan && plan.after === state.queueIndex && state.queue[plan.index] === plan.track) return plan.index;
-    const index = pickShuffleIndex();
-    state.shufflePlan = index < 0 ? null : { after: state.queueIndex, index, track: state.queue[index] };
+  // The planned upcoming shuffle indices. The plan is dropped when it was made for another song or
+  // the queue changed under it, and topped up to `count` songs.
+  function plannedShuffleIndices(count) {
+    let plan = state.shufflePlan;
+    const valid = plan && plan.after === state.queueIndex && plan.entries.every(e => state.queue[e.index] === e.track);
+    if (!valid) plan = state.shufflePlan = { after: state.queueIndex, entries: [] };
+    while (plan.entries.length < count) {
+      const index = pickShuffleIndex(new Set(plan.entries.map(e => e.index)));
+      if (index < 0) break;
+      plan.entries.push({ index, track: state.queue[index] });
+    }
+    return plan.entries.slice(0, count).map(e => e.index);
+  }
+
+  // Next in shuffle: the first planned song; the rest of the plan carries over to it.
+  function takePlannedShuffleIndex() {
+    const [index] = plannedShuffleIndices(1);
+    if (index === undefined) return -1;
+    state.shufflePlan = { after: index, entries: state.shufflePlan.entries.slice(1) };
     return index;
   }
 
+  // Preloads the next few songs one after another (each can take seconds), nearest first.
   async function preloadNextTrackStream() {
     if (!state.queue || state.queueIndex < 0) return;
-    const nextTrack = (state.isShuffle && !shuffleProvider)
-      ? state.queue[plannedShuffleIndex()]
-      : state.queue[state.queueIndex + 1];
+    const run = (state._preloadRun || 0) + 1;
+    state._preloadRun = run;
+    const upcoming = (state.isShuffle && !shuffleProvider)
+      ? plannedShuffleIndices(PRELOAD_AHEAD).map(index => state.queue[index])
+      : state.queue.slice(state.queueIndex + 1, state.queueIndex + 1 + PRELOAD_AHEAD);
+    for (let i = 0; i < upcoming.length; i++) {
+      if (state._preloadRun !== run) return; // a newer song started; it preloads its own
+      await preloadTrackStream(upcoming[i], i === 0);
+    }
+  }
+
+  async function preloadTrackStream(nextTrack, isNext) {
     if (!nextTrack || nextTrack.isCached || nextTrack.platform === 'local') return;
     const curQuality = localStorage.getItem('riff_audio_quality') || 'medium';
     if (nextTrack._preloadedStreamUrl && nextTrack._preloadedStreamQuality === curQuality) {
-      warmUpNextAudioBuffer(nextTrack._preloadedStreamUrl);
+      if (isNext) warmUpNextAudioBuffer(nextTrack._preloadedStreamUrl);
       return;
     }
     try {
@@ -4392,7 +4418,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (data && data.success && data.streamUrl) {
         nextTrack._preloadedStreamUrl = data.streamUrl;
         nextTrack._preloadedStreamQuality = curQuality;
-        warmUpNextAudioBuffer(data.streamUrl);
+        if (isNext) warmUpNextAudioBuffer(data.streamUrl);
       }
     } catch (_) {}
   }
@@ -8377,7 +8403,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
       if (state.queue.length === 0) return;
-      if (nextIdx < 0 && !provider) nextIdx = plannedShuffleIndex();
+      if (nextIdx < 0 && !provider) nextIdx = takePlannedShuffleIndex();
       if (nextIdx < 0) {
         const eligible = state.queue.map((track, index) => index)
           .filter(index => !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
@@ -8387,7 +8413,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         const candidates = pool.length ? pool : eligible;
         nextIdx = candidates[Math.floor(Math.random() * candidates.length)];
       }
-      state.shufflePlan = null;
       state.queueIndex = nextIdx;
       recordPlayedIndex(nextIdx);
       playTrack(state.queue[nextIdx]);

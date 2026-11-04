@@ -322,6 +322,7 @@ const vibeCache = new Map();
 const ytArtistCache = new Map();
 const scClientCache = new Map();
 const downloadingSet = new Set();
+const ytDownloadsInFlight = new Map(); // video id -> promise of the running yt-dlp download race
 const prefetchingSet = new Set();
 const downloadInFlight = new Map();
 
@@ -2823,6 +2824,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
         activeYtDlps.add(proc);
         proc.once('close', () => activeYtDlps.delete(proc));
         if (timedOut) proc.kill('SIGKILL');
+        if (typeof extraOpts.onChild === 'function') extraOpts.onChild(proc);
       }
     });
   };
@@ -3008,43 +3010,79 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       if (!vid) return null;
       const localUrl = `http://127.0.0.1:${ACTIVE_PORT}/api/local-track?id=${encodeURIComponent(vid)}`;
       if (await findCachedFile(vid)) return localUrl;
-      const tempBase = path.join(CACHE_DIR, `${vid}.temp.${crypto.randomBytes(4).toString('hex')}`);
+      if (ytDownloadsInFlight.has(vid)) return (await ytDownloadsInFlight.get(vid)) ? localUrl : null;
       const format = quality === 'low' ? 'wa[ext=m4a]/wa/ba'
         : (quality === 'high' || quality === 'max') ? 'ba'
         : 'ba[ext=m4a]/ba';
-      const removeTemp = async () => {
+
+      // One yt-dlp download into a temp file; resolves with the file, or null if it failed.
+      const downloadOnce = async (noCookies, onChild) => {
+        const tempBase = path.join(CACHE_DIR, `${vid}.temp.${crypto.randomBytes(4).toString('hex')}`);
+        const removeTemp = async () => {
+          try {
+            for (const f of await fs.promises.readdir(CACHE_DIR)) {
+              if (path.join(CACHE_DIR, f).startsWith(tempBase)) await fs.promises.unlink(path.join(CACHE_DIR, f)).catch(() => {});
+            }
+          } catch (_) {}
+        };
         try {
-          for (const f of await fs.promises.readdir(CACHE_DIR)) {
-            if (path.join(CACHE_DIR, f).startsWith(tempBase)) await fs.promises.unlink(path.join(CACHE_DIR, f)).catch(() => {});
+          await runYtDlp([
+            '--no-config', '--no-warnings', '--no-playlist', '--no-part',
+            '--socket-timeout', '10', '--retries', '2',
+            '-f', format,
+            '-o', `${tempBase}.%(ext)s`,
+            '--', `https://www.youtube.com/watch?v=${vid}`
+          ], 30000, { quiet: true, noCookies, onChild });
+          const files = await fs.promises.readdir(CACHE_DIR);
+          const tempFile = files.map(f => path.join(CACHE_DIR, f)).find(f => f.startsWith(tempBase + '.'));
+          if (!tempFile) return null;
+          const stat = await fs.promises.stat(tempFile);
+          const ext = path.extname(tempFile).toLowerCase();
+          if (stat.size > 60000 && ['.opus', '.webm', '.m4a', '.mp3'].includes(ext)) return tempFile;
+        } catch (err) {
+          if (/confirm your age|not a bot|Sign in to confirm|age-restricted|LOGIN_REQUIRED/i.test(String((err && err.message) || err || ''))) {
+            needYtAuth = true;
           }
-        } catch (_) {}
-      };
-      try {
-        await runYtDlp([
-          '--no-config', '--no-warnings', '--no-playlist', '--no-part',
-          '--socket-timeout', '10', '--retries', '2',
-          '-f', format,
-          '-o', `${tempBase}.%(ext)s`,
-          '--', `https://www.youtube.com/watch?v=${vid}`
-        ], 30000, { quiet: true });
-        const files = await fs.promises.readdir(CACHE_DIR);
-        const tempFile = files.map(f => path.join(CACHE_DIR, f)).find(f => f.startsWith(tempBase + '.'));
-        if (!tempFile) return null;
-        const stat = await fs.promises.stat(tempFile);
-        const ext = path.extname(tempFile).toLowerCase();
-        if (stat.size <= 60000 || !['.opus', '.webm', '.m4a', '.mp3'].includes(ext)) {
-          await removeTemp();
-          return null;
         }
-        await fs.promises.rename(tempFile, path.join(CACHE_DIR, `${vid}${ext}`));
-        saveTrackMetadata(vid, { id: vid, title, artist, duration, thumbnail, platform: 'ytmusic', fileSize: stat.size });
-        return localUrl;
-      } catch (err) {
         await removeTemp();
-        if (/confirm your age|not a bot|Sign in to confirm|age-restricted|LOGIN_REQUIRED/i.test(String((err && err.message) || err || ''))) {
-          needYtAuth = true;
-        }
         return null;
+      };
+
+      // YouTube answers yt-dlp's lookup in anywhere from 4 to 20 seconds and refuses about one in
+      // five, so two downloads run side by side (signed in and anonymous when there is a sign-in)
+      // and the first to finish wins; the other is stopped.
+      const race = new Promise((resolve) => {
+        const procs = [];
+        let pending = 2;
+        let won = false;
+        for (const noCookies of [false, hasYtLoginCookies()]) {
+          downloadOnce(noCookies, (proc) => procs.push(proc)).then(async (file) => {
+            if (file && !won) {
+              won = true;
+              for (const proc of procs) {
+                if (proc.exitCode === null && !proc.killed) { try { proc.kill('SIGKILL'); } catch (_) {} }
+              }
+              try {
+                const stat = await fs.promises.stat(file);
+                await fs.promises.rename(file, path.join(CACHE_DIR, `${vid}${path.extname(file).toLowerCase()}`));
+                saveTrackMetadata(vid, { id: vid, title, artist, duration, thumbnail, platform: 'ytmusic', fileSize: stat.size });
+                resolve(true);
+              } catch (_) {
+                await fs.promises.unlink(file).catch(() => {});
+                resolve(false);
+              }
+            } else if (file) {
+              await fs.promises.unlink(file).catch(() => {});
+            }
+            if (--pending === 0 && !won) resolve(false);
+          }).catch(() => { if (--pending === 0 && !won) resolve(false); });
+        }
+      });
+      ytDownloadsInFlight.set(vid, race);
+      try {
+        return (await race) ? localUrl : null;
+      } finally {
+        ytDownloadsInFlight.delete(vid);
       }
     };
 
