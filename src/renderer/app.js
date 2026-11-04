@@ -4337,9 +4337,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     fetch(streamUrl, { headers: { 'Range': 'bytes=0-262143' } }).catch(() => {});
   }
 
+  // Shuffle picks its next song when the current one starts rather than when Next is pressed,
+  // so that song can be preloaded like the next song in an unshuffled queue.
+  function pickShuffleIndex() {
+    const eligible = state.queue.map((track, index) => index)
+      .filter(index => index !== state.queueIndex && !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
+    if (eligible.length === 0) return -1;
+    const recent = new Set(state.queueHistory.slice(-Math.max(1, Math.floor(eligible.length / 2))));
+    const pool = eligible.filter(index => !recent.has(index));
+    const candidates = pool.length ? pool : eligible;
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  function plannedShuffleIndex() {
+    const plan = state.shufflePlan;
+    if (plan && plan.after === state.queueIndex && state.queue[plan.index] === plan.track) return plan.index;
+    const index = pickShuffleIndex();
+    state.shufflePlan = index < 0 ? null : { after: state.queueIndex, index, track: state.queue[index] };
+    return index;
+  }
+
   async function preloadNextTrackStream() {
     if (!state.queue || state.queueIndex < 0) return;
-    const nextTrack = state.queue[state.queueIndex + 1];
+    const nextTrack = (state.isShuffle && !shuffleProvider)
+      ? state.queue[plannedShuffleIndex()]
+      : state.queue[state.queueIndex + 1];
     if (!nextTrack || nextTrack.isCached || nextTrack.platform === 'local') return;
     const curQuality = localStorage.getItem('riff_audio_quality') || 'medium';
     if (nextTrack._preloadedStreamUrl && nextTrack._preloadedStreamQuality === curQuality) {
@@ -8355,6 +8377,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
       if (state.queue.length === 0) return;
+      if (nextIdx < 0 && !provider) nextIdx = plannedShuffleIndex();
       if (nextIdx < 0) {
         const eligible = state.queue.map((track, index) => index)
           .filter(index => !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
@@ -8364,6 +8387,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const candidates = pool.length ? pool : eligible;
         nextIdx = candidates[Math.floor(Math.random() * candidates.length)];
       }
+      state.shufflePlan = null;
       state.queueIndex = nextIdx;
       recordPlayedIndex(nextIdx);
       playTrack(state.queue[nextIdx]);
