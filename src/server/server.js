@@ -458,10 +458,16 @@ async function pruneDiskCache() {
       } catch (e) {}
     }
     // Keep the cache under its limit by removing the songs played longest ago (findCachedFile
-    // touches a song's time each time it is played).
-    let total = songs.reduce((sum, s) => sum + s.size, 0);
-    songs.sort((a, b) => a.used - b.used);
-    for (const song of songs) {
+    // touches a song's time each time it is played). Songs in playlists or the liked songs are
+    // never removed and don't count toward the limit; until the library is known (right after
+    // start, or the server running on its own) nothing is removed.
+    const pinnedTracks = typeof playlistTracks === 'function' ? playlistTracks() : null;
+    if (!pinnedTracks) return;
+    const pinned = pinnedCacheIds(pinnedTracks);
+    const removable = songs.filter(s => !pinned.has(path.basename(s.fullPath, path.extname(s.fullPath))));
+    let total = removable.reduce((sum, s) => sum + s.size, 0);
+    removable.sort((a, b) => a.used - b.used);
+    for (const song of removable) {
       if (total <= CACHE_LIMIT_BYTES) break;
       try {
         await fs.promises.unlink(song.fullPath);
@@ -5879,26 +5885,32 @@ function queueRemotePrefetch(track) {
   runRemotePrefetch();
 }
 
+// Resolves a track's stream (downloading it into the cache) as the player would, at low priority,
+// without anyone waiting on the answer.
+async function fetchTrackInBackground(track) {
+  // handleStreamInfo answers through a response object; this one just swallows the answer.
+  const sink = new (require('events').EventEmitter)();
+  Object.assign(sink, {
+    writableEnded: false, headersSent: false,
+    setHeader() {}, writeHead() { this.headersSent = true; },
+    write() { return true; },
+    end() { this.writableEnded = true; this.emit('finish'); this.emit('close'); }
+  });
+  const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium', prefetch: '1' };
+  const fakeReq = { url: '/api/stream-info?' + new URLSearchParams(query).toString(), headers: {} };
+  try {
+    await handleStreamInfo(fakeReq, sink, track.url || '', track.id || '', track.platform || 'ytmusic',
+      track.title || '', track.artist || '', track.duration || 0, track.thumbnail || '', 40);
+  } catch (_) {}
+}
+
 async function runRemotePrefetch() {
   if (remotePrefetchRunning >= PREFETCH_CONCURRENCY) return;
   remotePrefetchRunning++;
   try {
     while (remotePrefetchQueue.length > 0) {
       const { key, track } = remotePrefetchQueue.shift();
-      // handleStreamInfo answers through a response object; this one just swallows the answer.
-      const sink = new (require('events').EventEmitter)();
-      Object.assign(sink, {
-        writableEnded: false, headersSent: false,
-        setHeader() {}, writeHead() { this.headersSent = true; },
-        write() { return true; },
-        end() { this.writableEnded = true; this.emit('finish'); this.emit('close'); }
-      });
-      const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium', prefetch: '1' };
-      const fakeReq = { url: '/api/stream-info?' + new URLSearchParams(query).toString(), headers: {} };
-      try {
-        await handleStreamInfo(fakeReq, sink, track.url || '', track.id || '', track.platform || 'ytmusic',
-          track.title || '', track.artist || '', track.duration || 0, track.thumbnail || '', 40);
-      } catch (_) {}
+      await fetchTrackInBackground(track);
       remotePrefetchKeys.delete(key);
     }
   } finally {
@@ -5906,11 +5918,84 @@ async function runRemotePrefetch() {
   }
   if (remotePrefetchQueue.length > 0) runRemotePrefetch();
 }
+
+// ---- playlist songs stay downloaded -------------------------------------------------------
+// Every song in a playlist or the liked songs is kept in the cache: missing ones are fetched in
+// the background one at a time, and the cache limit never removes them (pruneDiskCache).
+const PLAYLIST_SYNC_EVERY_MS = 10 * 60 * 1000;
+const PLAYLIST_SYNC_RETRY_MS = 24 * 3600 * 1000; // a song that could not be fetched is tried again a day later
+const playlistSyncFailed = new Map(); // track key -> when fetching it last failed
+let playlistSyncRunning = false;
+let playlistSyncScheduled = false;
+
+const trackKey = (artist, title) => `${String(artist || '').toLowerCase().trim()}::${String(title || '').toLowerCase().trim()}`;
+const AUDIO_EXTS = ['.opus', '.webm', '.m4a', '.mp3'];
+const hasCachedAudio = (cid) => !!cid && AUDIO_EXTS.some(ext => fs.existsSync(path.join(CACHE_DIR, cid + ext)));
+
+// Songs of all playlists and the liked songs, from the window's saved library (null when the
+// library is not available, e.g. the server running on its own).
+function playlistTracks() {
+  const data = remoteHandlers.library ? remoteHandlers.library('pinned', '') : null;
+  if (!data || !Array.isArray(data.tracks)) return null;
+  return data.tracks.filter(t => t && t.title && t.platform !== 'local');
+}
+
+// Cache ids (file names without extension) that belong to playlist songs.
+function pinnedCacheIds(tracks) {
+  const keys = new Set(tracks.map(t => trackKey(t.artist, t.title)));
+  const ids = new Set(tracks.map(t => cleanTrackId(t.id || '')).filter(Boolean));
+  for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
+    if (meta && meta.title && keys.has(trackKey(meta.artist, meta.title))) ids.add(cid);
+  }
+  return ids;
+}
+
+async function syncPlaylistDownloads() {
+  if (playlistSyncRunning) return;
+  const tracks = playlistTracks();
+  if (!tracks) return;
+  playlistSyncRunning = true;
+  try {
+    const cachedByKey = new Map();
+    for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
+      if (meta && meta.title) cachedByKey.set(trackKey(meta.artist, meta.title), cid);
+    }
+    const isCached = (t) => hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(trackKey(t.artist, t.title)));
+    const seen = new Set();
+    const missing = [];
+    for (const t of tracks) {
+      const key = trackKey(t.artist, t.title);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const failedAt = playlistSyncFailed.get(key);
+      if (failedAt && Date.now() - failedAt < PLAYLIST_SYNC_RETRY_MS) continue;
+      if (!isCached(t)) missing.push(t);
+    }
+    if (missing.length) try { logger.log('info', `playlist sync: fetching ${missing.length} songs`); } catch (_) {}
+    for (const t of missing) {
+      await fetchTrackInBackground(t);
+      const ok = hasCachedAudio(cleanTrackId(t.id || '')) || !!findCachedFileByMeta(t.title, t.artist);
+      if (ok) playlistSyncFailed.delete(trackKey(t.artist, t.title));
+      else playlistSyncFailed.set(trackKey(t.artist, t.title), Date.now());
+      await new Promise(r => setTimeout(r, 2000)); // gently, one song at a time
+    }
+  } finally {
+    playlistSyncRunning = false;
+  }
+}
+
+function schedulePlaylistSync() {
+  if (playlistSyncScheduled) return;
+  playlistSyncScheduled = true;
+  setTimeout(() => syncPlaylistDownloads().catch(() => {}), 60 * 1000).unref(); // after the worker warms up
+  setInterval(() => syncPlaylistDownloads().catch(() => {}), PLAYLIST_SYNC_EVERY_MS).unref();
+}
 let remoteState = null;
 let remoteHandlers = { command: null, library: null };
 
 function setRemoteHandlers(handlers) {
   remoteHandlers = Object.assign({}, remoteHandlers, handlers);
+  if (remoteHandlers.library) schedulePlaylistSync();
 }
 
 function setRemoteState(state) {
@@ -9556,7 +9641,7 @@ function stopServer() {
   });
 }
 
-module.exports = { startServer, stopServer, PORT, getServerToken, setRemoteHandlers, setRemoteState, fetchLyricsDirect, fetchLrcLib, fetchGeniusLyrics, fetchNetEaseWords, fetchKugouLyrics, fetchMusixmatchLyrics, fetchNeteaseLyrics, fetchSoundCloudSearch, ytmusicSearch, parseYrc, cleanSearchResults };
+module.exports = { startServer, stopServer, PORT, getServerToken, setRemoteHandlers, setRemoteState, pruneDiskCache, syncPlaylistDownloads, fetchLyricsDirect, fetchLrcLib, fetchGeniusLyrics, fetchNetEaseWords, fetchKugouLyrics, fetchMusixmatchLyrics, fetchNeteaseLyrics, fetchSoundCloudSearch, ytmusicSearch, parseYrc, cleanSearchResults };
 
 if (require.main === module) {
   startServer();

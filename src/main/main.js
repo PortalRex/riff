@@ -397,6 +397,11 @@ function runGUI() {
       return playlist ? { name: playlist.name, tracks: (playlist.tracks || []).map(slim) } : null;
     }
     if (kind === 'liked') return { name: 'Liked songs', tracks: list('devsize_favorites').map(slim) };
+    if (kind === 'pinned') { // every playlist's songs plus the liked songs: kept downloaded
+      const all = list('devsize_favorites');
+      for (const p of list('devsize_playlists')) if (Array.isArray(p.tracks)) all.push(...p.tracks);
+      return { name: 'Playlist songs', tracks: all.filter(Boolean).map(slim) };
+    }
     if (kind === 'local') {
       const files = list('riff_local_files').length > 0 ? list('riff_local_files') : list('riff_local_tracks');
       let removed = [];
