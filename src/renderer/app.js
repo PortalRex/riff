@@ -7250,11 +7250,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     tvkSeekSlider.addEventListener('change', stopTvkSeek);
   }
 
-  if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
-    navigator.mediaDevices.addEventListener('devicechange', () => {
-      updateTvkOutput();
-    });
-  }
+  onAudioDeviceChange(() => updateTvkOutput());
 
   const TVK_DEFAULTS = {
     font: 'inherit',
@@ -18714,6 +18710,10 @@ function bindCoverHoldZoom(wrapEl) {
   if (audioOutputTrigger && audioOutputDropdown) {
     audioOutputTrigger.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!audioOutputDropdown.classList.contains('open')) {
+        startWatchingAudioDevices();
+        refreshAudioOutputDevices();
+      }
       audioOutputDropdown.classList.toggle('open');
     });
     document.addEventListener('click', () => {
@@ -18721,8 +18721,21 @@ function bindCoverHoldZoom(wrapEl) {
     });
   }
 
+  // Device-change listeners are collected here and only attached once devices are being watched
+  // (watching makes Chromium start its camera service; see refreshAudioOutputDevices' caller).
+  function onAudioDeviceChange(handler) {
+    (onAudioDeviceChange.handlers = onAudioDeviceChange.handlers || []).push(handler);
+    if (onAudioDeviceChange.watching) navigator.mediaDevices.addEventListener('devicechange', handler);
+  }
+
+  function startWatchingAudioDevices() {
+    if (onAudioDeviceChange.watching || !navigator.mediaDevices || !navigator.mediaDevices.addEventListener) return;
+    onAudioDeviceChange.watching = true;
+    for (const handler of onAudioDeviceChange.handlers || []) navigator.mediaDevices.addEventListener('devicechange', handler);
+  }
+
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-    navigator.mediaDevices.addEventListener('devicechange', async () => {
+    onAudioDeviceChange(async () => {
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
@@ -18746,11 +18759,13 @@ function bindCoverHoldZoom(wrapEl) {
     });
   }
 
-  refreshAudioOutputDevices().then(() => {
-    if (currentAudioOutputDeviceId && currentAudioOutputDeviceId !== 'default') {
-      applyAudioOutputDevice(currentAudioOutputDeviceId);
-    }
-  });
+  // Listing media devices (and watching them for changes) makes Chromium start its camera service
+  // (~120 MB) and keep it running, so it only happens when the output picker is opened, or at
+  // startup when a non-default output was chosen and has to be found again.
+  if (currentAudioOutputDeviceId && currentAudioOutputDeviceId !== 'default') {
+    startWatchingAudioDevices();
+    refreshAudioOutputDevices().then(() => applyAudioOutputDevice(currentAudioOutputDeviceId));
+  }
 
   const sliderCrossfade = document.getElementById('slider-crossfade');
   const valCrossfade = document.getElementById('val-crossfade');

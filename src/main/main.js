@@ -83,7 +83,8 @@ if (process.platform === 'linux') {
 
 if (process.platform === 'win32') {
   enabledFeatures.push('HardwareMediaKeyHandling', 'MediaSessionService');
-  app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+  // Audio runs inside the main process instead of its own (~70 MB less).
+  app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion,AudioServiceOutOfProcess');
 }
 
 if (enabledFeatures.length > 0) {

@@ -2002,7 +2002,7 @@ import threading
 
 import yt_dlp
 
-WORKERS_PER_MODE = 3
+WORKERS_PER_MODE = 2
 WARMUP_VIDEO = "jNQXAC9IVRw"
 START_BYTES = 64 * 1024
 
