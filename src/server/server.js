@@ -433,7 +433,37 @@ function findCachedFileByMeta(title, artist) {
 }
 
 // The most cached songs may take up (RIFF_CACHE_LIMIT_GB overrides the 10 GB default).
-const CACHE_LIMIT_BYTES = (parseFloat(process.env.RIFF_CACHE_LIMIT_GB) || 10) * 1024 ** 3;
+// ---- fork settings ------------------------------------------------------------------------
+// Switches for what this fork adds, kept in fork-settings.json in the data folder and changed
+// through the remote API (the Flow plugin's "rf /settings").
+const FORK_SETTINGS_PATH = path.join(DATA_DIR, 'fork-settings.json');
+const FORK_SETTINGS = {
+  keepPlaylistsDownloaded: { default: false, label: 'Keep playlist songs downloaded', description: 'Download every song in your playlists and liked songs, and never remove them from the cache' },
+  prefetch: { default: true, label: 'Prefetch likely picks', description: 'Start loading the top search results and the first songs of albums and artists while they are on screen' },
+  raceLookups: { default: true, label: 'Two lookups per song', description: 'Fetch each new song signed in and anonymous at once and keep the faster one (fewer slow songs, twice the requests)' },
+  signedInSearch: { default: true, label: 'Signed-in YouTube Music search', description: 'Send your YouTube sign-in with searches (YouTube Music refuses fewer of them)' },
+  cacheLimitGB: { default: 10, label: 'Cache limit (GB)', description: 'Songs played longest ago are removed above this' },
+};
+let forkSettings = {};
+try { forkSettings = JSON.parse(fs.readFileSync(FORK_SETTINGS_PATH, 'utf8')) || {}; } catch (_) {}
+
+function forkSetting(key) {
+  const spec = FORK_SETTINGS[key];
+  const value = forkSettings[key];
+  return (spec && typeof value === typeof spec.default) ? value : spec && spec.default;
+}
+
+function setForkSetting(key, value) {
+  const spec = FORK_SETTINGS[key];
+  if (!spec || typeof value !== typeof spec.default) return false;
+  if (key === 'cacheLimitGB' && !(value >= 1 && value <= 2000)) return false;
+  forkSettings[key] = value;
+  try { fs.writeFileSync(FORK_SETTINGS_PATH, JSON.stringify(forkSettings, null, 2)); } catch (_) {}
+  return true;
+}
+
+// The cache limit; RIFF_CACHE_LIMIT_GB (for tests) overrides the setting.
+const cacheLimitBytes = () => (parseFloat(process.env.RIFF_CACHE_LIMIT_GB) || forkSetting('cacheLimitGB')) * 1024 ** 3;
 
 async function pruneDiskCache() {
   try {
@@ -458,17 +488,22 @@ async function pruneDiskCache() {
       } catch (e) {}
     }
     // Keep the cache under its limit by removing the songs played longest ago (findCachedFile
-    // touches a song's time each time it is played). Songs in playlists or the liked songs are
-    // never removed and don't count toward the limit; until the library is known (right after
-    // start, or the server running on its own) nothing is removed.
-    const pinnedTracks = typeof playlistTracks === 'function' ? playlistTracks() : null;
-    if (!pinnedTracks) return;
-    const pinned = pinnedCacheIds(pinnedTracks);
+    // touches a song's time each time it is played). With "keep playlist songs downloaded" on,
+    // songs in playlists or the liked songs are never removed and don't count toward the limit,
+    // and until the library is known (right after start, or the server running on its own)
+    // nothing is removed.
+    let pinned = new Set();
+    if (forkSetting('keepPlaylistsDownloaded')) {
+      const pinnedTracks = typeof playlistTracks === 'function' ? playlistTracks() : null;
+      if (!pinnedTracks) return;
+      pinned = pinnedCacheIds(pinnedTracks);
+    }
     const removable = songs.filter(s => !pinned.has(path.basename(s.fullPath, path.extname(s.fullPath))));
     let total = removable.reduce((sum, s) => sum + s.size, 0);
     removable.sort((a, b) => a.used - b.used);
+    const limit = cacheLimitBytes();
     for (const song of removable) {
-      if (total <= CACHE_LIMIT_BYTES) break;
+      if (total <= limit) break;
       try {
         await fs.promises.unlink(song.fullPath);
         total -= song.size;
@@ -2225,7 +2260,9 @@ function workerDownloadToCache(worker, vid, format, meta, priority = 0) {
         settle(false);
       }
     };
-    const modes = hasYtLoginCookies() ? [YT_COOKIES_FILE, null] : [null, null];
+    // With "two lookups per song" off, one download (signed in when there is a sign-in).
+    const modes = !forkSetting('raceLookups') ? [hasYtLoginCookies() ? YT_COOKIES_FILE : null]
+      : hasYtLoginCookies() ? [YT_COOKIES_FILE, null] : [null, null];
     for (const cookies of modes) {
       const run = { tempBase: path.join(CACHE_DIR, `${vid}.temp.${crypto.randomBytes(4).toString('hex')}`) };
       run.id = ytWorkerRequest(worker, { video: vid, format, out: `${run.tempBase}.%(ext)s`, cookies, priority }, (message) => {
@@ -2442,7 +2479,7 @@ async function ytmSearchRequest(query, params = YTM_SONGS_PARAMS, attempt = 0, t
         'Origin': 'https://music.youtube.com',
         'Referer': 'https://music.youtube.com/',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
-      }, getYtAuthHeaders('https://music.youtube.com') || {})
+      }, (forkSetting('signedInSearch') && getYtAuthHeaders('https://music.youtube.com')) || {})
     }, (res) => {
       if (res.statusCode < 200 || res.statusCode >= 300) {
         try { logger.log('warn', `ytmusic search status ${res.statusCode}`); } catch (_) {}
@@ -3379,9 +3416,10 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       // and the first to finish wins; the other is stopped.
       const race = new Promise((resolve) => {
         const procs = [];
-        let pending = 2;
+        const runs = forkSetting('raceLookups') ? [false, hasYtLoginCookies()] : [false]; // noCookies per run
+        let pending = runs.length;
         let won = false;
-        for (const noCookies of [false, hasYtLoginCookies()]) {
+        for (const noCookies of runs) {
           downloadOnce(noCookies, (proc) => procs.push(proc)).then(async (file) => {
             if (file && !won) {
               won = true;
@@ -5876,6 +5914,7 @@ const PREFETCH_CONCURRENCY = 3;
 let remotePrefetchRunning = 0;
 
 function queueRemotePrefetch(track) {
+  if (!forkSetting('prefetch')) return;
   if (!track || !track.title || track.platform === 'local') return;
   const key = `${track.id || ''}|${(track.artist || '').toLowerCase()}|${(track.title || '').toLowerCase()}`;
   if (remotePrefetchKeys.has(key)) return;
@@ -5951,7 +5990,7 @@ function pinnedCacheIds(tracks) {
 }
 
 async function syncPlaylistDownloads() {
-  if (playlistSyncRunning) return;
+  if (playlistSyncRunning || !forkSetting('keepPlaylistsDownloaded')) return;
   const tracks = playlistTracks();
   if (!tracks) return;
   playlistSyncRunning = true;
@@ -5973,6 +6012,7 @@ async function syncPlaylistDownloads() {
     }
     if (missing.length) try { logger.log('info', `playlist sync: fetching ${missing.length} songs`); } catch (_) {}
     for (const t of missing) {
+      if (!forkSetting('keepPlaylistsDownloaded')) break; // switched off part-way
       await fetchTrackInBackground(t);
       const ok = hasCachedAudio(cleanTrackId(t.id || '')) || !!findCachedFileByMeta(t.title, t.artist);
       if (ok) playlistSyncFailed.delete(trackKey(t.artist, t.title));
@@ -6031,6 +6071,24 @@ function handleRemoteRoute(req, res, parsedUrl) {
   const route = parsedUrl.pathname.slice('/api/remote/'.length);
   const query = parsedUrl.query || {};
 
+  if (route === 'settings' && req.method === 'GET') {
+    const settings = Object.entries(FORK_SETTINGS).map(([key, spec]) => ({
+      key, label: spec.label, description: spec.description, type: typeof spec.default, default: spec.default, value: forkSetting(key)
+    }));
+    return send(200, { success: true, settings });
+  }
+  if (route === 'settings' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      const change = safeJsonParse(body, null);
+      if (!change || !setForkSetting(change.key, change.value)) return send(400, { success: false, error: 'unknown setting or bad value' });
+      if (change.key === 'keepPlaylistsDownloaded' && change.value) syncPlaylistDownloads().catch(() => {});
+      if (change.key === 'cacheLimitGB') pruneDiskCache();
+      return send(200, { success: true, key: change.key, value: forkSetting(change.key) });
+    });
+    return;
+  }
   if (route === 'state' && req.method === 'GET') {
     return send(200, { success: true, state: remoteState, now: Date.now() });
   }
