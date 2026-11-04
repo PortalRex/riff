@@ -10429,6 +10429,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       data.tracks = rankSearchTracks(query, data.tracks);
       state.searchResults = data.tracks;
+      // Start fetching the likeliest picks while the results are being looked at.
+      fetch(`http://127.0.0.1:${state.serverPort}/api/prefetch-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tracks: data.tracks.slice(0, 3) })
+      }).catch(() => {});
       state.searchOffset = data.tracks.length;
       state.searchHasMore = !!data.hasMore;
       const firstThumb = data.tracks.length ? getTrackThumbUrl(data.tracks[0]) : '';

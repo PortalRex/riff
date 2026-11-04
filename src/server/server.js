@@ -1958,6 +1958,279 @@ async function cacheResolvedStreamToDisk(rawStreamUrl, primaryCleanId, secondary
   }
 }
 
+// ---- warm yt-dlp worker -----------------------------------------------------------------
+// A fresh yt-dlp process needs about eight seconds per song (starting Python, fetching YouTube's
+// player code, starting its JS solver). This keeps one yt-dlp running inside Python with all of
+// that warm, which saves two to three seconds per song. (YouTube then makes each download wait
+// five seconds before it starts, which yt-dlp honours.) The script below is written to the data
+// folder because Python cannot read it from inside app.asar.
+const YTDLP_WORKER_SOURCE = String.raw`# Long-running yt-dlp for Riff. A fresh yt-dlp process spends most of a song lookup starting
+# Python, downloading YouTube's player code and starting its JS challenge solver; this process
+# keeps all of that warm, so a lookup takes about two seconds instead of eight.
+#
+# Protocol: one JSON message per line on stdin and stdout.
+#   in:  {"id": 1, "video": "<id>", "format": "ba", "out": "<path template with %(ext)s>", "cookies": "<file or null>",
+#         "priority": 0}                         0 = someone is waiting for it, 1 = prefetch (runs after)
+#        {"cancel": 1}                          stop that download (its file is left for the caller)
+#        {"warm": true, "cookies": "<file or null>"}  start that sign-in mode's instances early
+#   out: {"ready": true}
+#        {"id": 1, "started": "<file>"}         the first bytes are on disk (the file keeps growing)
+#        {"id": 1, "ok": true, "file": "<file>"} or {"id": 1, "ok": false, "error": "..."}
+# Each sign-in mode has a few warm YoutubeDL instances; the process exits when stdin closes.
+import itertools
+import json
+import queue
+import sys
+import threading
+
+import yt_dlp
+
+WORKERS_PER_MODE = 3
+WARMUP_VIDEO = "jNQXAC9IVRw"
+START_BYTES = 64 * 1024
+
+out_lock = threading.Lock()
+cancelled = set()
+order = itertools.count()  # keeps requests of the same priority first come, first served
+
+
+def reply(message):
+    with out_lock:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+
+
+def run_worker(cookies, jobs):
+    current = {"request": None, "started": False}
+
+    def progress(status):
+        request = current["request"]
+        if request is None:
+            return
+        if request["id"] in cancelled:
+            raise yt_dlp.utils.DownloadCancelled("cancelled")
+        done = status.get("downloaded_bytes") or 0
+        if not current["started"] and (done >= START_BYTES or status.get("status") == "finished"):
+            current["started"] = True
+            reply({"id": request["id"], "started": status.get("filename")})
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "nopart": True,  # write straight to the file Riff streams from
+        "geo_bypass": True,
+        "retries": 2,
+        "socket_timeout": 10,
+        "source_address": "0.0.0.0",  # IPv4, like Riff's other yt-dlp runs
+        "progress_hooks": [progress],
+    }
+    if cookies:
+        options["cookiefile"] = cookies
+    ydl = yt_dlp.YoutubeDL(options)
+    try:  # fetch the player code and start the solver before the first real request
+        ydl.extract_info("https://www.youtube.com/watch?v=" + WARMUP_VIDEO, download=False)
+    except Exception:
+        pass
+
+    while True:
+        _, _, request = jobs.get()
+        if request["id"] in cancelled:
+            reply({"id": request["id"], "ok": False, "error": "cancelled"})
+            continue
+        current["request"], current["started"] = request, False
+        try:
+            ydl.format_selector = ydl.build_format_selector(request["format"])
+            ydl.params["outtmpl"] = {"default": request["out"]}
+            info = ydl.extract_info("https://www.youtube.com/watch?v=" + request["video"], download=True)
+            downloads = info.get("requested_downloads") or []
+            path = downloads[0].get("filepath") if downloads else None
+            if path:
+                reply({"id": request["id"], "ok": True, "file": path})
+            else:
+                reply({"id": request["id"], "ok": False, "error": "nothing was downloaded"})
+        except BaseException as error:  # DownloadError, DownloadCancelled, anything unexpected
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            reply({"id": request["id"], "ok": False, "error": str(error)[:500]})
+        finally:
+            current["request"] = None
+            cancelled.discard(request["id"])
+
+
+def main():
+    modes = {}  # cookies file (or "") -> queue shared by that mode's instances
+
+    def queue_for(cookies):
+        key = cookies or ""
+        if key not in modes:
+            modes[key] = queue.PriorityQueue()
+            for _ in range(WORKERS_PER_MODE):
+                threading.Thread(target=run_worker, args=(cookies, modes[key]), daemon=True).start()
+        return modes[key]
+
+    reply({"ready": True})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if "cancel" in message:
+            cancelled.add(message["cancel"])
+        elif message.get("warm"):
+            queue_for(message.get("cookies"))
+        else:
+            queue_for(message.get("cookies")).put((message.get("priority", 0), next(order), message))
+
+
+if __name__ == "__main__":
+    main()
+`;
+
+let ytWorker = null;
+let ytWorkerFailures = 0;
+
+// The Python that yt-dlp is installed in (pip puts yt-dlp.exe in that Python's Scripts folder).
+function pythonForYtDlp() {
+  if (process.env.RIFF_PYTHON && fs.existsSync(process.env.RIFF_PYTHON)) return process.env.RIFF_PYTHON;
+  const bin = resolveBinary('yt-dlp');
+  if (!bin) return null;
+  const dir = path.dirname(bin);
+  const candidates = process.platform === 'win32'
+    ? [path.join(dir, '..', 'python.exe'), path.join(dir, 'python.exe')]
+    : [path.join(dir, 'python3'), path.join(dir, 'python')];
+  return candidates.find(p => fs.existsSync(p)) || null;
+}
+
+function getYtWorker() {
+  if (ytWorker && !ytWorker.dead) return ytWorker;
+  if (ytWorkerFailures >= 3) return null; // keeps failing: use plain yt-dlp runs instead
+  const python = pythonForYtDlp();
+  if (!python) return null;
+  const script = path.join(DATA_DIR, 'bin', 'riff-ytdlp-worker.py');
+  try {
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(script, YTDLP_WORKER_SOURCE);
+  } catch (_) {
+    return null;
+  }
+  const env = Object.assign({}, process.env);
+  const extra = [path.join(os.homedir(), '.deno', 'bin'), path.join(os.homedir(), '.local', 'bin')];
+  env.PATH = (env.PATH || '').split(path.delimiter).filter(Boolean).concat(extra).join(path.delimiter);
+  env.PYTHONUNBUFFERED = '1';
+  if (serverActiveProxy && typeof serverActiveProxy === 'string' && serverActiveProxy.trim()) {
+    env.HTTPS_PROXY = env.HTTP_PROXY = serverActiveProxy.trim();
+  }
+  let proc;
+  try {
+    proc = spawn(python, ['-I', script], { windowsHide: true, cwd: path.dirname(script), env });
+  } catch (_) {
+    ytWorkerFailures++;
+    return null;
+  }
+  const worker = { proc, pending: new Map(), nextId: 1, dead: false, buffer: '', stderr: '' };
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (data) => {
+    worker.buffer += data;
+    let newline;
+    while ((newline = worker.buffer.indexOf('\n')) >= 0) {
+      const line = worker.buffer.slice(0, newline);
+      worker.buffer = worker.buffer.slice(newline + 1);
+      const message = safeJsonParse(line, null);
+      if (!message || message.id === undefined) continue;
+      const handler = worker.pending.get(message.id);
+      if ('ok' in message) worker.pending.delete(message.id);
+      if (handler) handler(message);
+    }
+  });
+  proc.stderr.on('data', (data) => { worker.stderr = (worker.stderr + data).slice(-2000); });
+  proc.on('exit', (code) => {
+    worker.dead = true;
+    ytWorkerFailures++;
+    try { logger.log('warn', `yt-dlp worker exited (${code}): ${worker.stderr.slice(-300)}`); } catch (_) {}
+    for (const handler of worker.pending.values()) handler({ ok: false, error: 'yt-dlp worker exited' });
+    worker.pending.clear();
+  });
+  proc.on('error', () => {});
+  const send = (message) => { try { proc.stdin.write(JSON.stringify(message) + '\n'); } catch (_) {} };
+  worker.send = send;
+  send({ warm: true, cookies: null });
+  if (hasYtLoginCookies()) send({ warm: true, cookies: YT_COOKIES_FILE });
+  ytWorker = worker;
+  return worker;
+}
+
+function ytWorkerRequest(worker, request, onMessage) {
+  const id = worker.nextId++;
+  worker.pending.set(id, onMessage);
+  worker.send(Object.assign({ id }, request));
+  return id;
+}
+
+process.on('exit', () => { if (ytWorker && !ytWorker.dead) { try { ytWorker.proc.kill(); } catch (_) {} } });
+
+// Downloads a video's audio with the warm worker into the cache. Two downloads race (signed in and
+// anonymous when there is a sign-in); the first to start downloading wins and the other is
+// cancelled. Resolves true once the song is in the cache, false if both fail.
+function workerDownloadToCache(worker, vid, format, meta, priority = 0) {
+  return new Promise((resolve) => {
+    const runs = [];
+    let winner = null;
+    let failures = 0;
+    let settled = false;
+    const settle = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const removeRunFiles = (run) => {
+      fs.promises.readdir(CACHE_DIR).then(files => {
+        for (const f of files) if (path.join(CACHE_DIR, f).startsWith(run.tempBase)) fs.promises.unlink(path.join(CACHE_DIR, f)).catch(() => {});
+      }).catch(() => {});
+    };
+    const finish = async (run, message) => {
+      try {
+        const stat = await fs.promises.stat(message.file);
+        const ext = path.extname(message.file).toLowerCase();
+        if (stat.size <= 60000 || !['.opus', '.webm', '.m4a', '.mp3'].includes(ext)) throw new Error('unusable download');
+        await fs.promises.rename(message.file, path.join(CACHE_DIR, `${vid}${ext}`));
+        saveTrackMetadata(vid, { id: vid, title: meta.title || '', artist: meta.artist || '', duration: meta.duration || 0, thumbnail: meta.thumbnail || '', platform: 'ytmusic', fileSize: stat.size });
+        ytWorkerFailures = 0;
+        settle(true);
+      } catch (_) {
+        removeRunFiles(run);
+        settle(false);
+      }
+    };
+    const modes = hasYtLoginCookies() ? [YT_COOKIES_FILE, null] : [null, null];
+    for (const cookies of modes) {
+      const run = { tempBase: path.join(CACHE_DIR, `${vid}.temp.${crypto.randomBytes(4).toString('hex')}`) };
+      run.id = ytWorkerRequest(worker, { video: vid, format, out: `${run.tempBase}.%(ext)s`, cookies, priority }, (message) => {
+        if (message.started && !winner) {
+          winner = run;
+          for (const other of runs) if (other !== run) worker.send({ cancel: other.id });
+          return;
+        }
+        if (!('ok' in message)) return;
+        if (run === winner) return message.ok ? finish(run, message) : (removeRunFiles(run), settle(false));
+        if (message.ok && !winner) { winner = run; return finish(run, message); } // finished without a start report
+        removeRunFiles(run); // a cancelled or failed loser
+        if (!message.ok) failures++;
+        if (!winner && failures === runs.length) {
+          if (/confirm your age|not a bot|Sign in to confirm|age-restricted|LOGIN_REQUIRED/i.test(message.error || '')) meta.needsAuth = true;
+          settle(false);
+        }
+      });
+      runs.push(run);
+    }
+    setTimeout(() => {
+      if (winner) return;
+      for (const run of runs) worker.send({ cancel: run.id });
+      settle(false);
+    }, 30000);
+  });
+}
+
 async function downloadTrackToDisk(trackUrl, trackId, platform, meta = {}) {
   const cleanId = cleanTrackId(trackId);
   if (downloadingSet.has(cleanId) || await findCachedFile(cleanId)) return;
@@ -2055,6 +2328,11 @@ async function prefetchTrack(trackUrl, trackId, platform) {
   if (!cleanId && trackUrl && trackUrl.includes('v=')) {
     cleanId = cleanTrackId(trackUrl.split('v=')[1].split('&')[0]);
   }
+  // For YouTube this used the direct player lookup, whose links are often refused, and cached the
+  // refused link for two hours, so playing that song (often the top search result) failed, and
+  // the yt-dlp prefetch (queueRemotePrefetch) was skipped as "already cached". YouTube songs are
+  // prefetched through yt-dlp instead; this keeps SoundCloud only.
+  if (!(platform === 'soundcloud' || (trackUrl && trackUrl.includes('soundcloud.com')))) return;
   const quality = 'medium';
   const cacheKey = (cleanId || trackUrl).toLowerCase() + '_' + quality;
   if (!cacheKey || prefetchingSet.size > 2) return;
@@ -2840,6 +3118,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   const parsedUrl = (req && req.url) ? require('url').parse(req.url, true) : { query: {} };
   const forShare = Boolean(parsedUrl.query && parsedUrl.query.forShare === '1');
   const forceYtDlp = Boolean(parsedUrl.query && parsedUrl.query.forceYtDlp === '1');
+  const background = Boolean(parsedUrl.query && parsedUrl.query.prefetch === '1'); // a prefetch: nobody is waiting yet
   const quality = (parsedUrl.query && parsedUrl.query.quality) || 'medium';
   const queryQ = (parsedUrl.query && parsedUrl.query.q) ? String(parsedUrl.query.q).trim() : '';
   let cleanId = cleanTrackId(trackId);
@@ -3021,6 +3300,20 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       const format = quality === 'low' ? 'wa[ext=m4a]/wa/ba'
         : (quality === 'high' || quality === 'max') ? 'ba'
         : 'ba[ext=m4a]/ba';
+
+      const worker = getYtWorker();
+      if (worker) {
+        const meta = { title, artist, duration, thumbnail };
+        const started = workerDownloadToCache(worker, vid, format, meta, background ? 1 : 0);
+        ytDownloadsInFlight.set(vid, started);
+        try {
+          if (await started) return localUrl;
+        } finally {
+          ytDownloadsInFlight.delete(vid);
+        }
+        if (meta.needsAuth) needYtAuth = true;
+        return null;
+      }
 
       // One yt-dlp download into a temp file; resolves with the file, or null if it failed.
       const downloadOnce = async (noCookies, onChild) => {
@@ -5511,6 +5804,7 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/spotify-library',
   '/api/spotify-logout',
   '/api/prefetch',
+  '/api/prefetch-stream',
   '/api/check-cache',
   '/api/stream-info',
   '/api/track-analysis',
@@ -5546,24 +5840,28 @@ const REMOTE_ACTIONS = new Set([
   'addToPlaylist', 'startRadio', 'myWave', 'removeFromQueue', 'moveToNext', 'clearUpcoming', 'sleep', 'download'
 ]);
 
-// Background stream lookups asked for by remote clients (e.g. the top search result while the
-// user is still choosing), one at a time so they never crowd out what is actually playing.
+// Background stream lookups for songs someone is likely to pick next (the top search results, the
+// start of an album), so that by the time one is picked, YouTube's lookup and its five-second
+// wait are already done. A few run at once at low priority (the yt-dlp worker serves songs
+// someone is waiting for first); only the latest few requests are kept.
 const remotePrefetchQueue = [];
 const remotePrefetchKeys = new Set();
-let remotePrefetchBusy = false;
+const PREFETCH_CONCURRENCY = 3;
+let remotePrefetchRunning = 0;
 
 function queueRemotePrefetch(track) {
+  if (!track || !track.title || track.platform === 'local') return;
   const key = `${track.id || ''}|${(track.artist || '').toLowerCase()}|${(track.title || '').toLowerCase()}`;
   if (remotePrefetchKeys.has(key)) return;
-  if (remotePrefetchQueue.length >= 4) remotePrefetchKeys.delete(remotePrefetchQueue.shift().key); // keep only the latest few
+  if (remotePrefetchQueue.length >= 6) remotePrefetchKeys.delete(remotePrefetchQueue.shift().key);
   remotePrefetchKeys.add(key);
   remotePrefetchQueue.push({ key, track });
   runRemotePrefetch();
 }
 
 async function runRemotePrefetch() {
-  if (remotePrefetchBusy) return;
-  remotePrefetchBusy = true;
+  if (remotePrefetchRunning >= PREFETCH_CONCURRENCY) return;
+  remotePrefetchRunning++;
   try {
     while (remotePrefetchQueue.length > 0) {
       const { key, track } = remotePrefetchQueue.shift();
@@ -5575,7 +5873,7 @@ async function runRemotePrefetch() {
         write() { return true; },
         end() { this.writableEnded = true; this.emit('finish'); this.emit('close'); }
       });
-      const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium' };
+      const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium', prefetch: '1' };
       const fakeReq = { url: '/api/stream-info?' + new URLSearchParams(query).toString(), headers: {} };
       try {
         await handleStreamInfo(fakeReq, sink, track.url || '', track.id || '', track.platform || 'ytmusic',
@@ -5584,8 +5882,9 @@ async function runRemotePrefetch() {
       remotePrefetchKeys.delete(key);
     }
   } finally {
-    remotePrefetchBusy = false;
+    remotePrefetchRunning--;
   }
+  if (remotePrefetchQueue.length > 0) runRemotePrefetch();
 }
 let remoteState = null;
 let remoteHandlers = { command: null, library: null };
@@ -8790,6 +9089,19 @@ async function requestHandler(req, res) {
     return res.end(JSON.stringify({ success: true, artist: info }));
   }
 
+  if (parsedUrl.pathname === '/api/prefetch-stream' && req.method === 'POST') {
+    // The window's own search results: start fetching the likeliest picks (see queueRemotePrefetch).
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 262144) req.destroy(); });
+    req.on('end', () => {
+      const payload = safeJsonParse(body, {});
+      (Array.isArray(payload.tracks) ? payload.tracks.slice(0, 5) : []).forEach(queueRemotePrefetch);
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+    return;
+  }
+
   if (parsedUrl.pathname === '/api/prefetch') {
     const trackUrl = parsedUrl.query.url || '';
     const trackId = parsedUrl.query.id || '';
@@ -9190,6 +9502,7 @@ function startServer(port = PORT) {
       console.log(`devsize internal server running on http://127.0.0.1:${p}`);
       require('./tools').updateYtDlpIfManaged().catch(() => {});
       writeRemoteInfo(p);
+      getYtWorker(); // warm yt-dlp up before the first song is picked
       resolve(p);
     }).on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
@@ -9200,6 +9513,7 @@ function startServer(port = PORT) {
           console.log(`devsize internal server running on fallback port http://127.0.0.1:${p}`);
           require('./tools').updateYtDlpIfManaged().catch(() => {});
           writeRemoteInfo(p);
+      getYtWorker(); // warm yt-dlp up before the first song is picked
           resolve(p);
         });
       } else {
