@@ -404,11 +404,11 @@ function runGUI() {
     library: remoteLibrary,
     command: (command) => {
       if (!mainWindow || mainWindow.isDestroyed()) return false;
-      if (command.action === 'show') {
+      if (command.action === 'show' || command.action === 'download') { // the download dialog is in the window
         if (mainWindow.isMinimized()) mainWindow.restore();
         mainWindow.show();
         mainWindow.focus();
-        return true;
+        if (command.action === 'show') return true;
       }
       mainWindow.webContents.send('remote-command', command);
       return true;

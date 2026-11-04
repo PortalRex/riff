@@ -8327,9 +8327,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function maybePrepareAutoplay() {
-    if (!autoplayEnabled() || state.isRadioQueue || state.isShuffle || state.isRepeat) return;
+    if (!autoplayEnabled() || state.isRadioQueue || state.isRepeat) return;
     if (!state.currentTrack || !Array.isArray(state.queue) || state.queue.length === 0) return;
-    if (state.queueIndex + 1 < state.queue.length) return;
+    // Shuffle only autoplays when there is no other song to shuffle to (see playNext).
+    const nothingElse = state.queue.every((t, i) => i === state.queueIndex || !t || isTrackBlocked(t) || isArtistBlocked(t.artist));
+    if (state.isShuffle ? !nothingElse : state.queueIndex + 1 < state.queue.length) return;
     prepareAutoplay();
   }
 
@@ -8380,6 +8382,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (!state.isRadioQueue && !state.isShuffle && state.queueIndex + 1 >= state.queue.length && autoplayEnabled()) {
+      if (await startAutoplay()) return;
+    }
+
+    // Shuffle with nothing else to pick from replayed the same song; autoplay similar songs
+    // instead, as an unshuffled queue does at its end. Repeat still repeats.
+    if (state.isShuffle && !state.isRadioQueue && !state.isRepeat && autoplayEnabled()
+        && state.queue.every((t, i) => i === state.queueIndex || !t || isTrackBlocked(t) || isArtistBlocked(t.artist))) {
       if (await startAutoplay()) return;
     }
 
@@ -18358,8 +18367,99 @@ function bindCoverHoldZoom(wrapEl) {
         if (Number.isInteger(index) && index >= 0 && index < state.queue.length) playTrack(state.queue[index], index);
         break;
       }
+      case 'addToPlaylist': {
+        const track = remoteTrack(command.track);
+        const playlist = state.playlists.find(p => p.id === command.playlistId);
+        if (!track || !playlist) break;
+        if (!Array.isArray(playlist.tracks)) playlist.tracks = [];
+        playlist.tracks.push(stampAddedAt(track));
+        localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
+        renderPlaylistsList();
+        if (state.currentView === 'playlist-detail' && state.currentPlaylistId === playlist.id) openPlaylistDetail(playlist.id);
+        showToast(`Added to "${playlist.name}"`, 'success');
+        break;
+      }
+      case 'startRadio':
+        startSongRadio(command.track ? remoteTrack(command.track) : state.currentTrack);
+        break;
+      case 'myWave': playMyWave(); break;
+      case 'removeFromQueue':
+        if (Number.isInteger(command.index) && command.index !== state.queueIndex) {
+          removeQueueTracks([command.index]);
+          if (state.currentView === 'queue') renderQueueView();
+        }
+        break;
+      case 'moveToNext': {
+        const from = command.index;
+        if (!Number.isInteger(from) || from < 0 || from >= state.queue.length || from === state.queueIndex) break;
+        const [track] = state.queue.splice(from, 1);
+        if (from < state.queueIndex) state.queueIndex--;
+        state.queue.splice(state.queueIndex + 1, 0, track);
+        updateQueueBadge();
+        if (state.currentView === 'queue') renderQueueView();
+        showToast(typeof t === 'function' ? t('Playing next') : 'Playing next', 'success');
+        break;
+      }
+      case 'clearUpcoming':
+        if (state.queueIndex >= 0 && state.queue.length > state.queueIndex + 1) {
+          state.queue = state.queue.slice(0, state.queueIndex + 1);
+          state.isRadioQueue = false;
+          updateQueueBadge();
+          if (state.currentView === 'queue') renderQueueView();
+        }
+        break;
+      case 'sleep':
+        if (command.value === 'off' || command.value === 'end' || Number(command.value) > 0) setSleepTimer(String(command.value));
+        break;
+      case 'download': {
+        const track = command.track ? remoteTrack(command.track) : state.currentTrack;
+        if (track) openDownloadModalForTrack(track);
+        break;
+      }
     }
     publishRemoteState(true);
+  }
+
+  // Radio seeded with one song: that song, then songs Riff's recommender finds for it, topped up
+  // like any radio queue as it plays.
+  async function startSongRadio(seed) {
+    if (!seed) return;
+    playTrack(seed, [seed], 0, 'radio');
+    state.isRadioQueue = true;
+    try {
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/vibe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform: state.platform || 'ytmusic',
+          seeds: [{ artist: seed.artist || '', title: seed.title || '', id: seed.id || '' }],
+          topArtists: seed.artist ? [seed.artist] : [],
+          avoid: { ids: [String(seed.id || '')], keys: [], artists: [] },
+          count: 15
+        })
+      });
+      const data = await res.json();
+      const key = (t) => `${(t.artist || '').toLowerCase().trim()}::${(t.title || '').toLowerCase().trim()}`;
+      const seedKey = key(seed);
+      const fresh = (Array.isArray(data && data.tracks) ? data.tracks : []).filter(t => t && t.title && key(t) !== seedKey);
+      if (state.currentTrack === seed && fresh.length > 0) {
+        state.queue.push(...fresh);
+        updateQueueBadge();
+        if (state.currentView === 'queue') renderQueueView();
+        showToast(`Radio: ${fresh.length} songs like "${seed.title}"`, 'success');
+      }
+    } catch (_) {}
+  }
+
+  function currentLyricLine(position) {
+    const lines = state.syncedLyrics;
+    if (!Array.isArray(lines) || lines.length === 0 || lines[0].time < 0) return '';
+    let text = '';
+    for (const line of lines) {
+      if (line.time > position) break;
+      text = line.text || '';
+    }
+    return String(text).replace(/<[^>]+>/g, '').trim();
   }
 
   if (window.electronAPI && window.electronAPI.onRemoteCommand) {
@@ -18388,10 +18488,14 @@ function bindCoverHoldZoom(wrapEl) {
       queueIndex: state.queueIndex,
       queueLength: state.queue.length,
       queueStart,
-      queue: state.queue.slice(queueStart, queueStart + 60).map(brief)
+      queue: state.queue.slice(queueStart, queueStart + 60).map(brief),
+      lyric: currentLyricLine((audio && Number.isFinite(audio.currentTime)) ? audio.currentTime : 0),
+      radio: !!state.isRadioQueue,
+      sleep: state.sleepTimer ? { mode: state.sleepTimer.mode, endsAt: state.sleepTimer.endsAt || 0 } : null
     };
     const key = JSON.stringify([snapshot.track && snapshot.track.id, snapshot.liked, snapshot.isPlaying, snapshot.isLoading,
-      snapshot.volume, snapshot.muted, snapshot.shuffle, snapshot.repeat, snapshot.queueIndex, snapshot.queueLength]);
+      snapshot.volume, snapshot.muted, snapshot.shuffle, snapshot.repeat, snapshot.queueIndex, snapshot.queueLength,
+      snapshot.lyric, snapshot.radio, snapshot.sleep && snapshot.sleep.mode, snapshot.sleep && snapshot.sleep.endsAt]);
     const now = Date.now();
     if (!force && key === lastRemoteStateKey && now - lastRemoteStateAt < 5000) return;
     lastRemoteStateKey = key;

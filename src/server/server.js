@@ -2428,14 +2428,21 @@ async function fetchMetadataSearchFallback(query, limit = 24) {
   return [];
 }
 
+// When YouTube Music refuses the search (it has been answering 403), every lookup waited on the
+// refusal and its retries before falling back. After a failure the search is skipped for a while.
+const YTM_SEARCH_COOLDOWN_MS = 10 * 60 * 1000;
+let ytmSearchBlockedUntil = 0;
+
 async function ytmusicSearch(query, options = {}) {
   const timeoutMs = options.timeoutMs || 10000;
   const maxRetries = Number.isInteger(options.maxRetries) ? options.maxRetries : 2;
   const useFallback = options.fallback !== false;
   let json;
   try {
+    if (Date.now() < ytmSearchBlockedUntil) throw new Error('YouTube Music search is cooling down');
     json = await ytmSearchRequest(query, YTM_SONGS_PARAMS, 0, timeoutMs, maxRetries);
-  } catch (_) {
+  } catch (err) {
+    if (!/cooling down/.test(String(err && err.message))) ytmSearchBlockedUntil = Date.now() + YTM_SEARCH_COOLDOWN_MS;
     if (!useFallback) return [];
     try { return await directYoutubeSearch(query, true).then(tracks => tracks || []); } catch (_) { return []; }
   }
@@ -5535,8 +5542,51 @@ const REMOTE_TOKEN = crypto.randomBytes(24).toString('hex');
 const REMOTE_INFO_PATH = path.join(DATA_DIR, 'remote.json');
 const REMOTE_ACTIONS = new Set([
   'toggle', 'play', 'pause', 'next', 'prev', 'seek', 'volume', 'mute', 'shuffle', 'repeat', 'like',
-  'playTrack', 'queueTrack', 'playNextTrack', 'playList', 'playQueueIndex', 'show'
+  'playTrack', 'queueTrack', 'playNextTrack', 'playList', 'playQueueIndex', 'show',
+  'addToPlaylist', 'startRadio', 'myWave', 'removeFromQueue', 'moveToNext', 'clearUpcoming', 'sleep', 'download'
 ]);
+
+// Background stream lookups asked for by remote clients (e.g. the top search result while the
+// user is still choosing), one at a time so they never crowd out what is actually playing.
+const remotePrefetchQueue = [];
+const remotePrefetchKeys = new Set();
+let remotePrefetchBusy = false;
+
+function queueRemotePrefetch(track) {
+  const key = `${track.id || ''}|${(track.artist || '').toLowerCase()}|${(track.title || '').toLowerCase()}`;
+  if (remotePrefetchKeys.has(key)) return;
+  if (remotePrefetchQueue.length >= 4) remotePrefetchKeys.delete(remotePrefetchQueue.shift().key); // keep only the latest few
+  remotePrefetchKeys.add(key);
+  remotePrefetchQueue.push({ key, track });
+  runRemotePrefetch();
+}
+
+async function runRemotePrefetch() {
+  if (remotePrefetchBusy) return;
+  remotePrefetchBusy = true;
+  try {
+    while (remotePrefetchQueue.length > 0) {
+      const { key, track } = remotePrefetchQueue.shift();
+      // handleStreamInfo answers through a response object; this one just swallows the answer.
+      const sink = new (require('events').EventEmitter)();
+      Object.assign(sink, {
+        writableEnded: false, headersSent: false,
+        setHeader() {}, writeHead() { this.headersSent = true; },
+        write() { return true; },
+        end() { this.writableEnded = true; this.emit('finish'); this.emit('close'); }
+      });
+      const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium' };
+      const fakeReq = { url: '/api/stream-info?' + new URLSearchParams(query).toString(), headers: {} };
+      try {
+        await handleStreamInfo(fakeReq, sink, track.url || '', track.id || '', track.platform || 'ytmusic',
+          track.title || '', track.artist || '', track.duration || 0, track.thumbnail || '', 40);
+      } catch (_) {}
+      remotePrefetchKeys.delete(key);
+    }
+  } finally {
+    remotePrefetchBusy = false;
+  }
+}
 let remoteState = null;
 let remoteHandlers = { command: null, library: null };
 
@@ -5587,6 +5637,32 @@ function handleRemoteRoute(req, res, parsedUrl) {
   if (route === 'search' && req.method === 'GET') {
     const limit = Math.max(1, Math.min(30, parseInt(query.limit || '12', 10) || 12));
     return handleSearch(req, res, String(query.q || ''), String(query.platform || 'ytmusic'), limit, 0);
+  }
+  if (route === 'artist' && req.method === 'GET') {
+    if (!query.name) return send(400, { success: false, error: 'missing name' });
+    return fetchArtistInfo(String(query.name), String(query.hint || ''))
+      .then(artist => send(200, { success: true, artist }))
+      .catch(err => send(500, { success: false, error: String(err && err.message || err) }));
+  }
+  if (route === 'lyrics' && req.method === 'GET') {
+    return handleLyrics(req, res, String(query.title || ''), String(query.artist || ''), true, 'lrclib', parseFloat(query.duration) || 0);
+  }
+  if (route === 'local' && req.method === 'GET') {
+    const tracks = Object.values(libraryIndex)
+      .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
+      .map(item => ({ id: item.id, platform: 'local', title: item.title, artist: item.artist, duration: Number(item.duration) || 0, thumbnail: '' }));
+    return send(200, { success: true, name: 'Local files', tracks });
+  }
+  if (route === 'prefetch' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 65536) req.destroy(); });
+    req.on('end', () => {
+      const track = safeJsonParse(body, null);
+      if (!track || !track.title) return send(400, { success: false, error: 'missing track' });
+      queueRemotePrefetch(track);
+      return send(202, { success: true });
+    });
+    return;
   }
   if (route === 'command' && req.method === 'POST') {
     let body = '';
