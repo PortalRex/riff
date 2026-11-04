@@ -5648,10 +5648,12 @@ function handleRemoteRoute(req, res, parsedUrl) {
     return handleLyrics(req, res, String(query.title || ''), String(query.artist || ''), true, 'lrclib', parseFloat(query.duration) || 0);
   }
   if (route === 'local' && req.method === 'GET') {
-    const tracks = Object.values(libraryIndex)
+    // "My files" (added in the window, kept in its storage) plus files imported into the library.
+    const myFiles = remoteHandlers.library ? (remoteHandlers.library('local', '') || {}).tracks || [] : [];
+    const imported = Object.values(libraryIndex)
       .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
       .map(item => ({ id: item.id, platform: 'local', title: item.title, artist: item.artist, duration: Number(item.duration) || 0, thumbnail: '' }));
-    return send(200, { success: true, name: 'Local files', tracks });
+    return send(200, { success: true, name: 'Local files', tracks: myFiles.concat(imported) });
   }
   if (route === 'prefetch' && req.method === 'POST') {
     let body = '';

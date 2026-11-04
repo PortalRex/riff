@@ -18267,7 +18267,7 @@ function bindCoverHoldZoom(wrapEl) {
   function remoteTrack(raw) {
     if (!raw || typeof raw !== 'object' || !raw.title) return null;
     const track = {};
-    for (const key of ['id', 'title', 'artist', 'album', 'duration', 'thumbnail', 'cover', 'url', 'platform', 'searchQuery', 'isExplicit']) {
+    for (const key of ['id', 'title', 'artist', 'album', 'duration', 'thumbnail', 'cover', 'url', 'platform', 'searchQuery', 'isExplicit', 'path', 'filePath']) {
       if (raw[key] !== undefined && raw[key] !== null) track[key] = raw[key];
     }
     if (!track.id) track.id = 'cand_' + Math.random().toString(36).slice(2, 10);

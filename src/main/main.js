@@ -396,6 +396,18 @@ function runGUI() {
       return playlist ? { name: playlist.name, tracks: (playlist.tracks || []).map(slim) } : null;
     }
     if (kind === 'liked') return { name: 'Liked songs', tracks: list('devsize_favorites').map(slim) };
+    if (kind === 'local') {
+      const files = list('riff_local_files').length > 0 ? list('riff_local_files') : list('riff_local_tracks');
+      let removed = [];
+      try { removed = JSON.parse(store.riff_removed_local_paths || '[]'); } catch (_) {}
+      const path = (t) => String(t.path || t.filePath || '');
+      return {
+        name: 'My files',
+        tracks: files
+          .filter(t => t && t.title && !removed.includes(path(t)) && !removed.includes(String(t.id || '')))
+          .map(t => Object.assign(slim(t), { platform: 'local', path: path(t) }))
+      };
+    }
     if (kind === 'history') return { name: 'History', tracks: list('devsize_history').map(slim) };
     return null;
   }
