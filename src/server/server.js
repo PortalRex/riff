@@ -5964,11 +5964,22 @@ async function runRemotePrefetch() {
 // the background one at a time, and the cache limit never removes them (pruneDiskCache).
 const PLAYLIST_SYNC_EVERY_MS = 10 * 60 * 1000;
 const PLAYLIST_SYNC_RETRY_MS = 24 * 3600 * 1000; // a song that could not be fetched is tried again a day later
-const playlistSyncFailed = new Map(); // track key -> when fetching it last failed
+const trackKey = (artist, title) => `${String(artist || '').toLowerCase().trim()}::${String(title || '').toLowerCase().trim()}`;
+// Songs that could not be fetched, kept in the data folder so the list (shown in Settings and the
+// Flow plugin) and the day's wait survive a restart.
+const PLAYLIST_SYNC_FAILED_PATH = path.join(DATA_DIR, 'playlist-sync-failed.json');
+const playlistSyncFailed = new Map(); // track key -> { title, artist, at: when fetching it last failed }
+try {
+  for (const f of JSON.parse(fs.readFileSync(PLAYLIST_SYNC_FAILED_PATH, 'utf8'))) {
+    if (f && f.title && Date.now() - f.at < PLAYLIST_SYNC_RETRY_MS) playlistSyncFailed.set(trackKey(f.artist, f.title), f);
+  }
+} catch (_) {}
+function savePlaylistSyncFailed() {
+  try { fs.writeFileSync(PLAYLIST_SYNC_FAILED_PATH, JSON.stringify([...playlistSyncFailed.values()])); } catch (_) {}
+}
 let playlistSyncRunning = false;
 let playlistSyncScheduled = false;
 
-const trackKey = (artist, title) => `${String(artist || '').toLowerCase().trim()}::${String(title || '').toLowerCase().trim()}`;
 const AUDIO_EXTS = ['.opus', '.webm', '.m4a', '.mp3'];
 const hasCachedAudio = (cid) => !!cid && AUDIO_EXTS.some(ext => fs.existsSync(path.join(CACHE_DIR, cid + ext)));
 
@@ -6001,6 +6012,7 @@ function playlistSyncStatus() {
     const tracks = playlistTracks();
     let songs = 0;
     let downloaded = 0;
+    const failedSongs = [];
     if (tracks) {
       const cachedByKey = new Map();
       for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
@@ -6013,9 +6025,14 @@ function playlistSyncStatus() {
         seen.add(key);
         songs++;
         if (hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(key))) downloaded++;
+        else if (playlistSyncFailed.has(key)) {
+          // Listed only while still in a playlist and still missing (playing it may have downloaded it).
+          const f = playlistSyncFailed.get(key);
+          failedSongs.push({ title: f.title, artist: f.artist });
+        }
       }
     }
-    playlistStatusCache = { at: Date.now(), value: { songs, downloaded } };
+    playlistStatusCache = { at: Date.now(), value: { songs, downloaded, failedSongs } };
   }
   const p = playlistSyncProgress;
   const perSong = p.done > 0 ? (Date.now() - p.startedAt) / p.done : 10000;
@@ -6047,8 +6064,8 @@ async function syncPlaylistDownloads() {
       const key = trackKey(t.artist, t.title);
       if (seen.has(key)) continue;
       seen.add(key);
-      const failedAt = playlistSyncFailed.get(key);
-      if (failedAt && Date.now() - failedAt < PLAYLIST_SYNC_RETRY_MS) continue;
+      const failed = playlistSyncFailed.get(key);
+      if (failed && Date.now() - failed.at < PLAYLIST_SYNC_RETRY_MS) continue;
       if (!isCached(t)) missing.push(t);
     }
     if (missing.length) try { logger.log('info', `playlist sync: fetching ${missing.length} songs`); } catch (_) {}
@@ -6058,8 +6075,13 @@ async function syncPlaylistDownloads() {
       playlistSyncProgress.current = { title: t.title, artist: t.artist || '' };
       await fetchTrackInBackground(t);
       const ok = hasCachedAudio(cleanTrackId(t.id || '')) || !!findCachedFileByMeta(t.title, t.artist);
-      if (ok) playlistSyncFailed.delete(trackKey(t.artist, t.title));
-      else { playlistSyncFailed.set(trackKey(t.artist, t.title), Date.now()); playlistSyncProgress.failed++; }
+      if (ok) {
+        if (playlistSyncFailed.delete(trackKey(t.artist, t.title))) savePlaylistSyncFailed();
+      } else {
+        playlistSyncFailed.set(trackKey(t.artist, t.title), { title: t.title, artist: t.artist || '', at: Date.now() });
+        playlistSyncProgress.failed++;
+        savePlaylistSyncFailed();
+      }
       playlistSyncProgress.done++;
       playlistStatusCache.at = 0; // the downloaded count changed
       await new Promise(r => setTimeout(r, 2000)); // gently, one song at a time

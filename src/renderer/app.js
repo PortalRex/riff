@@ -17248,14 +17248,13 @@ function bindCoverHoldZoom(wrapEl) {
     const text = document.getElementById('fork-sync-text');
     const bar = document.getElementById('fork-sync-bar');
     if (!text || !bar || !status) return;
-    const { songs, downloaded, enabled, running, current, secondsLeft, failed } = status;
+    const { songs, downloaded, enabled, running, current, secondsLeft } = status;
     let line;
     if (!songs) line = 'No songs in your playlists or liked songs yet';
     else if (running) {
       line = `${downloaded} of ${songs} downloaded`;
       if (current) line += ` · now: ${current.title}${current.artist ? ' — ' + current.artist : ''}`;
       if (secondsLeft > 0) line += ` · about ${formatTimeLeft(secondsLeft)} left`;
-      if (failed > 0) line += ` · ${failed} not found`;
     } else if (enabled) {
       line = downloaded >= songs ? `All ${songs} songs downloaded` : `${downloaded} of ${songs} downloaded · the rest start within 10 minutes`;
     } else {
@@ -17263,6 +17262,27 @@ function bindCoverHoldZoom(wrapEl) {
     }
     text.textContent = line;
     bar.style.width = songs ? `${Math.round((downloaded / songs) * 100)}%` : '0%';
+    showPlaylistSyncFailures(status.failedSongs || []);
+  }
+
+  // The songs the sync could not download, as a list that opens under the progress line. It is
+  // only rebuilt when the list changes, so it stays open while the progress refreshes.
+  function showPlaylistSyncFailures(failedSongs) {
+    const box = document.getElementById('fork-sync-failed');
+    if (!box) return;
+    const signature = failedSongs.map(f => `${f.artist}::${f.title}`).join('\n');
+    if (box.dataset.signature === signature) return;
+    box.dataset.signature = signature;
+    box.hidden = failedSongs.length === 0;
+    const summary = box.querySelector('summary');
+    summary.textContent = `${failedSongs.length} ${failedSongs.length === 1 ? 'song' : 'songs'} could not be downloaded · tried again in a day`;
+    const list = box.querySelector('ul');
+    list.innerHTML = '';
+    for (const f of failedSongs) {
+      const li = document.createElement('li');
+      li.textContent = f.artist ? `${f.title} — ${f.artist}` : f.title;
+      list.appendChild(li);
+    }
   }
 
   async function renderForkSettings() {
@@ -17309,7 +17329,10 @@ function bindCoverHoldZoom(wrapEl) {
           progress.innerHTML =
             '<div style="height: 4px; border-radius: 2px; background: var(--md-sys-color-surface-container-high); overflow: hidden;">' +
             '<div id="fork-sync-bar" style="height: 100%; width: 0%; background: var(--md-sys-color-primary); transition: width 0.4s;"></div></div>' +
-            '<div id="fork-sync-text" style="margin-top: 6px; font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);"></div>';
+            '<div id="fork-sync-text" style="margin-top: 6px; font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);"></div>' +
+            '<details id="fork-sync-failed" hidden style="margin-top: 6px; font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);">' +
+            '<summary style="cursor: pointer; color: var(--md-sys-color-error);"></summary>' +
+            '<ul style="margin: 6px 0 0; padding-left: 18px; max-height: 160px; overflow-y: auto; user-select: text;"></ul></details>';
           item.style.flexDirection = 'column';
           item.style.alignItems = 'stretch';
           item.appendChild(progress);
