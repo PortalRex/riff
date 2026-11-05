@@ -5,6 +5,11 @@ const path = require('path');
 const CHECK_DELAY_MS = 1500;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
 
+// This is the PortalRex fork: updates come from its own releases, never from rootscripts/riff
+// (that would replace the fork and drop its changes). Fork versions look like 44.1.1-portalrex.2.
+const UPDATE_REPO = { owner: 'PortalRex', repo: 'riff' };
+const RELEASES_API = `https://api.github.com/repos/${UPDATE_REPO.owner}/${UPDATE_REPO.repo}/releases/latest`;
+
 function readIgnored(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')).version || ''; } catch (e) { return ''; }
 }
@@ -31,24 +36,13 @@ function initUpdater(getWindow) {
   if (pkg.version) {
     app.setVersion(pkg.version);
   }
-  const releasesUrl = `${pkg.homepage || 'https://github.com/rootscripts/riff'}/releases`;
+  const releasesUrl = `https://github.com/${UPDATE_REPO.owner}/${UPDATE_REPO.repo}/releases`;
   let manualCheck = false;
   let installNow = false;
   let current = null;
 
   try { ipcMain.removeHandler('get-app-version'); } catch (_) {}
   ipcMain.handle('get-app-version', () => app.getVersion());
-
-  // This is the PortalRex fork. An update from rootscripts/riff would replace it and drop the
-  // fork's changes, so it never checks for, downloads or installs updates; "Check for updates"
-  // just answers that there is none.
-  try { ipcMain.removeHandler('update-check'); } catch (_) {}
-  ipcMain.handle('update-check', () => {
-    const win = getWindow();
-    if (win && !win.isDestroyed()) win.webContents.send('update-not-available', { version: app.getVersion() });
-    return { ok: true };
-  });
-  return;
 
   const isDev = !app.isPackaged;
   const devConfigFile = path.join(__dirname, '../../dev-app-update.yml');
@@ -61,7 +55,7 @@ function initUpdater(getWindow) {
 
   const checkViaGithubApi = async () => {
     try {
-      const res = await fetch('https://api.github.com/repos/rootscripts/riff/releases/latest', {
+      const res = await fetch(RELEASES_API, {
         headers: { 'User-Agent': 'Riff-Player' }
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -102,6 +96,8 @@ function initUpdater(getWindow) {
     try {
       const eu = require('electron-updater');
       autoUpdater = eu.autoUpdater;
+      // The fork's releases, whatever app-update.yml this install came with.
+      autoUpdater.setFeedURL({ provider: 'github', owner: UPDATE_REPO.owner, repo: UPDATE_REPO.repo });
       if (isDev) autoUpdater.forceDevUpdateConfig = true;
       autoUpdater.autoDownload = false;
       autoUpdater.autoInstallOnAppQuit = false;
@@ -119,7 +115,7 @@ function initUpdater(getWindow) {
         let htmlUrl = `${releasesUrl}/tag/v${info.version}`;
 
         try {
-          const res = await fetch('https://api.github.com/repos/rootscripts/riff/releases/latest', {
+          const res = await fetch(RELEASES_API, {
             headers: { 'User-Agent': 'Riff-Player' }
           });
           if (res.ok) {
