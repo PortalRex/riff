@@ -9532,6 +9532,101 @@ document.addEventListener('DOMContentLoaded', async () => {
     setNavCount(document.getElementById('albums-count'), getSavedAlbums().length);
   }
 
+  const isSameAlbum = (a, album) => (album.id && a.id === album.id) || (album.title && a.title === album.title && a.artist === album.artist);
+  const isAlbumSaved = (album) => getSavedAlbums().some(a => isSameAlbum(a, album));
+
+  // Saves the album, or removes it when it is already saved; returns whether it is saved now.
+  // With "like album tracks" on, saving also likes the songs passed in.
+  function toggleSavedAlbum(album, tracks) {
+    const list = getSavedAlbums();
+    const idx = list.findIndex(a => isSameAlbum(a, album));
+    if (idx >= 0) {
+      list.splice(idx, 1);
+    } else {
+      list.unshift({
+        id: album.id,
+        title: album.title || '',
+        artist: album.artist || '',
+        cover: album.cover || '',
+        type: album.type || 'Album',
+        year: album.year || '',
+        trackCount: album.trackCount || (Array.isArray(tracks) ? tracks.length : 0)
+      });
+      if (localStorage.getItem('riff_like_album_tracks') === 'true' && Array.isArray(tracks)) {
+        let favAdded = false;
+        tracks.forEach(tr => {
+          if (tr && !state.favorites.some(f => isSameTrack(f, tr))) {
+            state.favorites.unshift(typeof stampAddedAt === 'function' ? stampAddedAt(tr) : tr);
+            favAdded = true;
+          }
+        });
+        if (favAdded) {
+          localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites));
+          if (typeof updateFavoritesBadge === 'function') updateFavoritesBadge();
+          if (typeof updateFavoriteIcon === 'function') updateFavoriteIcon();
+          if (state.currentView === 'favorites' && typeof renderFavoritesView === 'function') renderFavoritesView();
+        }
+      }
+    }
+    setSavedAlbums(list);
+    if (state.currentView === 'albums') renderSavedAlbums();
+    return idx < 0;
+  }
+
+  // The album's songs: the ones it came with, or looked up the way the album page does.
+  async function fetchAlbumTracks(album) {
+    if (Array.isArray(album.tracks) && album.tracks.length) return album.tracks;
+    const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/albums/tracks?id=${encodeURIComponent(album.id || '')}&title=${encodeURIComponent(album.title || '')}&artist=${encodeURIComponent(album.artist || '')}`);
+    const data = await res.json();
+    if (!data || !data.success || !Array.isArray(data.tracks) || data.tracks.length === 0) {
+      throw new Error(data && data.error ? data.error : 'no songs found');
+    }
+    return data.tracks;
+  }
+
+  // Right-click menu of an album card: save it, or download all its songs.
+  function openAlbumContextMenu(e, album) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (ctxMenuEl && ctxMenuEl.classList.contains('open')) {
+      closeTrackContextMenu();
+      return;
+    }
+    if (!album || album.type === 'Daily Mix') return;
+    const saved = isAlbumSaved(album);
+    showCtxMenuItems(e, [
+      {
+        active: saved,
+        label: saved ? 'Remove from saved albums' : 'Save album',
+        icon: `<svg viewBox="0 0 24 24" fill="${saved ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>`,
+        action: async () => {
+          const wantsTracks = !saved && localStorage.getItem('riff_like_album_tracks') === 'true';
+          const tracks = wantsTracks ? await fetchAlbumTracks(album).catch(() => null) : null;
+          const nowSaved = toggleSavedAlbum(album, tracks);
+          showToast(nowSaved ? `Saved ${album.title}` : `Removed ${album.title} from saved albums`, 'success');
+        }
+      },
+      {
+        label: 'Download album',
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+        action: async () => {
+          try {
+            const tracks = await fetchAlbumTracks(album);
+            openDownloadAllModal({
+              name: album.title || 'Album',
+              kind: 'album',
+              cover: album.cover || '',
+              // Songs without their own picture get the album cover embedded.
+              tracks: tracks.map(t => (t.thumbnail || t.cover || !album.cover) ? t : Object.assign({}, t, { thumbnail: album.cover }))
+            });
+          } catch (err) {
+            showToast(`Could not load ${album.title}: ${err.message}`, 'error');
+          }
+        }
+      }
+    ]);
+  }
+
   function renderSavedAlbums() {
     const container = document.getElementById('saved-albums-grid');
     if (!container) return;
@@ -9558,6 +9653,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const alb = albums[idx];
       if (!alb) return;
       card.addEventListener('click', () => openAlbum(alb));
+      card.addEventListener('contextmenu', (e) => openAlbumContextMenu(e, alb));
       card.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
@@ -9607,8 +9703,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         btnSaveAlbum.style.display = '';
         const updateBtnState = () => {
-          const list = getSavedAlbums();
-          const isSaved = list.some(a => (album.id && a.id === album.id) || (album.title && a.title === album.title && a.artist === album.artist));
+          const isSaved = isAlbumSaved(album);
           const svg = btnSaveAlbum.querySelector('svg');
           if (svg) svg.setAttribute('fill', isSaved ? 'currentColor' : 'none');
           btnSaveAlbum.classList.toggle('active', isSaved);
@@ -9617,41 +9712,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateBtnState();
         btnSaveAlbum.onclick = (e) => {
           e.stopPropagation();
-          let list = getSavedAlbums();
-          const idx = list.findIndex(a => (album.id && a.id === album.id) || (album.title && a.title === album.title && a.artist === album.artist));
-          if (idx >= 0) {
-            list.splice(idx, 1);
-          } else {
-            list.unshift({
-              id: album.id,
-              title: album.title || '',
-              artist: album.artist || '',
-              cover: album.cover || '',
-              type: album.type || 'Album',
-              year: album.year || '',
-              trackCount: album.trackCount || (album._tracks ? album._tracks.length : 0)
-            });
-            if (localStorage.getItem('riff_like_album_tracks') === 'true' && album._tracks && Array.isArray(album._tracks)) {
-              let favAdded = false;
-              album._tracks.forEach(tr => {
-                if (tr && !state.favorites.some(f => isSameTrack(f, tr))) {
-                  state.favorites.unshift(typeof stampAddedAt === 'function' ? stampAddedAt(tr) : tr);
-                  favAdded = true;
-                }
-              });
-              if (favAdded) {
-                localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites));
-                if (typeof updateFavoritesBadge === 'function') updateFavoritesBadge();
-                if (typeof updateFavoriteIcon === 'function') updateFavoriteIcon();
-                if (state.currentView === 'favorites' && typeof renderFavoritesView === 'function') renderFavoritesView();
-              }
-            }
-          }
-          setSavedAlbums(list);
+          toggleSavedAlbum(album, album._tracks);
           updateBtnState();
-          if (state.currentView === 'albums') {
-            renderSavedAlbums();
-          }
         };
       }
     }
@@ -9945,6 +10007,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const album = albums[idx];
         if (!album) return;
         card.addEventListener('click', () => openAlbum(album));
+        card.addEventListener('contextmenu', (e) => openAlbumContextMenu(e, album));
         card.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') {
             e.preventDefault();
@@ -10729,6 +10792,67 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }, true);
 
+  // The one right-click menu element shared by songs and albums, made on first use.
+  function ensureCtxMenuEl() {
+    if (ctxMenuEl) return;
+    ctxMenuEl = document.createElement('div');
+    ctxMenuEl.className = 'riff-ctx-menu';
+    document.body.appendChild(ctxMenuEl);
+    document.addEventListener('pointerdown', (ev) => {
+      if (!ctxMenuEl || !ctxMenuEl.classList.contains('open')) return;
+      if (performance.now() - ctxMenuOpenedAt < 180) return;
+      if (ctxMenuEl.contains(ev.target)) return;
+      closeTrackContextMenu();
+    });
+    window.addEventListener('wheel', (ev) => {
+      if (!ctxMenuEl || !ctxMenuEl.classList.contains('open')) return;
+      if (ctxMenuEl.contains(ev.target) || ctxMenuEl.matches(':hover')) return;
+      closeTrackContextMenu();
+    }, { passive: true });
+    window.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') closeTrackContextMenu();
+    });
+  }
+
+  // Fills the menu with items ({ label, icon, action, active, danger } or { divider: true })
+  // and opens it at the pointer, kept inside the window.
+  function showCtxMenuItems(e, items) {
+    ensureCtxMenuEl();
+    ctxMenuOpenedAt = performance.now();
+    ctxMenuEl.innerHTML = '';
+    items.forEach((it) => {
+      if (it.divider) {
+        const div = document.createElement('div');
+        div.className = 'riff-ctx-divider';
+        ctxMenuEl.appendChild(div);
+        return;
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'riff-ctx-item' + (it.active ? ' is-active' : '') + (it.danger ? ' danger' : '');
+      const lbl = typeof t === 'function' ? t(it.label) : it.label;
+      btn.innerHTML = `${it.icon}<span>${lbl}</span>`;
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        closeTrackContextMenu();
+        it.action();
+      });
+      ctxMenuEl.appendChild(btn);
+    });
+
+    ctxMenuEl.classList.remove('open');
+    ctxMenuEl.style.left = '0px';
+    ctxMenuEl.style.top = '0px';
+    const rect = ctxMenuEl.getBoundingClientRect();
+    const posX = (e.clientX + rect.width + 12 > window.innerWidth) ? (e.clientX - rect.width) : e.clientX;
+    const posY = (e.clientY + rect.height + 12 > window.innerHeight) ? (e.clientY - rect.height) : e.clientY;
+    ctxMenuEl.style.left = `${Math.max(8, posX)}px`;
+    ctxMenuEl.style.top = `${Math.max(8, posY)}px`;
+    requestAnimationFrame(() => {
+      if (ctxMenuEl) ctxMenuEl.classList.add('open');
+    });
+  }
+
   function openTrackContextMenu(e, track, options = {}) {
     if (ctxMenuEl && ctxMenuEl.classList.contains('open')) {
       closeTrackContextMenu();
@@ -10737,29 +10861,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     e.preventDefault();
     e.stopPropagation();
     if (!track) return;
-    ctxMenuOpenedAt = performance.now();
     setCtxTipCount(3);
     if (tgTipEl) tgTipEl.classList.remove('visible');
-
-    if (!ctxMenuEl) {
-      ctxMenuEl = document.createElement('div');
-      ctxMenuEl.className = 'riff-ctx-menu';
-      document.body.appendChild(ctxMenuEl);
-      document.addEventListener('pointerdown', (ev) => {
-        if (!ctxMenuEl || !ctxMenuEl.classList.contains('open')) return;
-        if (performance.now() - ctxMenuOpenedAt < 180) return;
-        if (ctxMenuEl.contains(ev.target)) return;
-        closeTrackContextMenu();
-      });
-      window.addEventListener('wheel', (ev) => {
-        if (!ctxMenuEl || !ctxMenuEl.classList.contains('open')) return;
-        if (ctxMenuEl.contains(ev.target) || ctxMenuEl.matches(':hover')) return;
-        closeTrackContextMenu();
-      }, { passive: true });
-      window.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Escape') closeTrackContextMenu();
-      });
-    }
 
     const isFav = typeof isTrackFavorited === 'function'
       ? isTrackFavorited(track)
@@ -10913,38 +11016,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     }
 
-    ctxMenuEl.innerHTML = '';
-    items.forEach((it) => {
-      if (it.divider) {
-        const div = document.createElement('div');
-        div.className = 'riff-ctx-divider';
-        ctxMenuEl.appendChild(div);
-        return;
-      }
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'riff-ctx-item' + (it.active ? ' is-active' : '') + (it.danger ? ' danger' : '');
-      const lbl = typeof t === 'function' ? t(it.label) : it.label;
-      btn.innerHTML = `${it.icon}<span>${lbl}</span>`;
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        closeTrackContextMenu();
-        it.action();
-      });
-      ctxMenuEl.appendChild(btn);
-    });
-
-    ctxMenuEl.classList.remove('open');
-    ctxMenuEl.style.left = '0px';
-    ctxMenuEl.style.top = '0px';
-    const rect = ctxMenuEl.getBoundingClientRect();
-    const posX = (e.clientX + rect.width + 12 > window.innerWidth) ? (e.clientX - rect.width) : e.clientX;
-    const posY = (e.clientY + rect.height + 12 > window.innerHeight) ? (e.clientY - rect.height) : e.clientY;
-    ctxMenuEl.style.left = `${Math.max(8, posX)}px`;
-    ctxMenuEl.style.top = `${Math.max(8, posY)}px`;
-    requestAnimationFrame(() => {
-      if (ctxMenuEl) ctxMenuEl.classList.add('open');
-    });
+    showCtxMenuItems(e, items);
   }
   window.openTrackContextMenu = openTrackContextMenu;
 
@@ -12226,6 +12298,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
           const alb = validAlbums[idx];
           if (!alb) return;
           card.addEventListener('click', () => openAlbum(alb));
+          card.addEventListener('contextmenu', (e) => openAlbumContextMenu(e, alb));
           card.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
               e.preventDefault();
@@ -23245,14 +23318,16 @@ function bindCoverHoldZoom(wrapEl) {
     openModal(el.downloadModal);
   }
 
+  // Downloads every song of a playlist, or of an album ({ kind: 'album', cover }), to disk.
   function openDownloadAllModal(playlist) {
     if (!el.downloadModal) return;
     const tracks = (playlist && Array.isArray(playlist.tracks) ? playlist.tracks : []).filter(t => t.platform !== 'local');
     if (!tracks.length) {
-      showToast('No remote tracks to download in this playlist', 'info');
+      showToast(`No remote tracks to download in this ${(playlist && playlist.kind) || 'playlist'}`, 'info');
       return;
     }
     trackToDownload = null;
+    const kind = playlist.kind || 'playlist';
     downloadBatch = { name: playlist.name || 'Playlist', tracks };
     el.downloadModal.classList.add('batch-mode');
     const dlModeTabs = document.getElementById('dl-mode-tabs');
@@ -23262,10 +23337,14 @@ function bindCoverHoldZoom(wrapEl) {
     if (dlPaneDownload) dlPaneDownload.classList.remove('hidden');
     if (dlPaneTrim) dlPaneTrim.classList.add('hidden');
     const modalTitle = document.getElementById('download-modal-title');
-    if (modalTitle) modalTitle.textContent = 'Download playlist';
+    if (modalTitle) modalTitle.textContent = `Download ${kind}`;
     if (el.downloadPreviewTitle) el.downloadPreviewTitle.textContent = playlist.name || 'Playlist';
     if (el.downloadPreviewArtist) el.downloadPreviewArtist.textContent = `${tracks.length} track${tracks.length === 1 ? '' : 's'}`;
-    if (el.downloadPreviewThumb) el.downloadPreviewThumb.style.display = 'none';
+    if (el.downloadPreviewThumb) {
+      // An album shows its cover; a playlist has none here.
+      if (playlist.cover) el.downloadPreviewThumb.src = playlist.cover;
+      el.downloadPreviewThumb.style.display = playlist.cover ? 'block' : 'none';
+    }
     if (el.downloadPreviewFallback) el.downloadPreviewFallback.style.display = 'none';
     updateDownloadBtnLabel();
     updateLosslessQualityState();
