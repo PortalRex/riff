@@ -2091,7 +2091,7 @@ import threading
 
 import yt_dlp
 
-WORKERS_PER_MODE = 2
+WORKERS_PER_MODE = 3  # one per background line (see waitForBackgroundTurn) and one for clicks
 WARMUP_VIDEO = "jNQXAC9IVRw"
 START_BYTES = 64 * 1024
 
@@ -2282,36 +2282,36 @@ process.on('exit', () => { if (ytWorker && !ytWorker.dead) { try { ytWorker.proc
 // Downloads a video's audio with the warm worker into the cache. Two downloads race (signed in and
 // anonymous when there is a sign-in); the first to start downloading wins and the other is
 // cancelled. Resolves true once the song is in the cache, false if both fail.
-// Background downloads (prefetches, the queue's next songs, the playlist sync) run one at a time:
-// each song takes one yt-dlp instance per sign-in mode and the worker has two, so one stays free for
-// a song someone clicks. Waiting ones go in order, likely picks (urgent) first; a click on a song
+// Background downloads run in two lines of one song each: likely picks (urgent: a search's top
+// result) and everything else (the other results, the queue's next songs, the playlist sync). A
+// background song takes one yt-dlp instance and the worker has three per sign-in mode, so one stays
+// free for a song someone clicks, and a likely pick never waits behind a preload. A click on a song
 // still waiting for its turn starts it at once (promote).
-let backgroundTurnHeld = false;
-const backgroundTurnQueue = []; // { urgent, take } oldest first, urgent ones ahead
+const backgroundLines = { urgent: { held: false, queue: [] }, other: { held: false, queue: [] } };
 function waitForBackgroundTurn(urgent = false) {
+  const line = urgent ? backgroundLines.urgent : backgroundLines.other;
   const turn = { promoted: false, holding: false };
   let release;
   turn.ready = new Promise(r => { release = r; });
-  const waiter = { urgent, take: () => { turn.holding = true; release(); } };
-  if (!backgroundTurnHeld) {
-    backgroundTurnHeld = true;
-    waiter.take();
+  const take = () => { turn.holding = true; release(); };
+  if (!line.held) {
+    line.held = true;
+    take();
   } else {
-    const at = urgent ? backgroundTurnQueue.findIndex(w => !w.urgent) : -1;
-    backgroundTurnQueue.splice(at < 0 ? backgroundTurnQueue.length : at, 0, waiter);
+    line.queue.push(take);
   }
   turn.promote = () => {
-    const i = backgroundTurnQueue.indexOf(waiter);
+    const i = line.queue.indexOf(take);
     if (i < 0) return; // already running
-    backgroundTurnQueue.splice(i, 1);
+    line.queue.splice(i, 1);
     turn.promoted = true;
     release();
   };
   turn.end = () => {
     if (!turn.holding) return;
     turn.holding = false;
-    const next = backgroundTurnQueue.shift();
-    if (next) next.take(); else backgroundTurnHeld = false;
+    const next = line.queue.shift();
+    if (next) next(); else line.held = false;
   };
   return turn;
 }
@@ -2342,8 +2342,10 @@ function workerDownloadToCache(worker, vid, format, meta, priority = 0) {
         settle(false);
       }
     };
-    // With "two lookups per song" off, one download (signed in when there is a sign-in).
-    const modes = !forkSetting('raceLookups') ? [hasYtLoginCookies() ? YT_COOKIES_FILE : null]
+    // With "two lookups per song" off, or in the background (nobody waits, and one lookup leaves
+    // the worker's other instances for songs someone clicks), one download (signed in when there is
+    // a sign-in).
+    const modes = !forkSetting('raceLookups') || priority > 0 ? [hasYtLoginCookies() ? YT_COOKIES_FILE : null]
       : hasYtLoginCookies() ? [YT_COOKIES_FILE, null] : [null, null];
     for (const cookies of modes) {
       const run = { tempBase: path.join(CACHE_DIR, `${vid}.temp.${crypto.randomBytes(4).toString('hex')}`) };
@@ -6036,8 +6038,8 @@ const REMOTE_ACTIONS = new Set([
 
 // Background stream lookups for songs someone is likely to pick next (the top search results, the
 // start of an album), so that by the time one is picked, YouTube's lookup and its five-second
-// wait are already done. One runs at a time, likeliest first, ahead of the other background
-// downloads (see waitForBackgroundTurn); only the latest few requests are kept.
+// wait are already done. One runs at a time with the other background downloads (a window search's
+// top result skips ahead: see /api/prefetch-stream); only the latest few requests are kept.
 const remotePrefetchQueue = [];
 const remotePrefetchKeys = new Set();
 const PREFETCH_CONCURRENCY = 1;
@@ -6086,7 +6088,7 @@ async function runRemotePrefetch() {
   try {
     while (remotePrefetchQueue.length > 0) {
       const { key, track } = remotePrefetchQueue.shift();
-      await fetchTrackInBackground(track, true);
+      await fetchTrackInBackground(track);
       remotePrefetchKeys.delete(key);
     }
   } finally {
@@ -9702,7 +9704,11 @@ async function requestHandler(req, res) {
     req.on('end', () => {
       const payload = safeJsonParse(body, {});
       clearRemotePrefetchQueue(); // the previous search's picks that have not started
-      (Array.isArray(payload.tracks) ? payload.tracks.slice(0, 5) : []).forEach(queueRemotePrefetch);
+      const tracks = Array.isArray(payload.tracks) ? payload.tracks.slice(0, 5) : [];
+      // The top result goes straight into the likely-picks line, so it never waits behind the
+      // previous search's other results; the rest queue up with the other background downloads.
+      if (tracks[0] && tracks[0].title && forkSetting('prefetch')) fetchTrackInBackground(tracks[0], true).catch(() => {});
+      tracks.slice(1).forEach(queueRemotePrefetch);
       res.writeHead(202, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     });
