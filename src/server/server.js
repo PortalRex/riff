@@ -316,6 +316,7 @@ const streamUrlCache = new Map();
 const streamCache = streamUrlCache;
 const urlCache = streamUrlCache;
 const streamInfoInflight = new Map();
+const streamInfoPromoters = new Map(); // cache key -> moves that background lookup to the front
 const lyricsCache = new Map();
 const artistCache = new Map();
 const vibeCache = new Map();
@@ -2281,6 +2282,40 @@ process.on('exit', () => { if (ytWorker && !ytWorker.dead) { try { ytWorker.proc
 // Downloads a video's audio with the warm worker into the cache. Two downloads race (signed in and
 // anonymous when there is a sign-in); the first to start downloading wins and the other is
 // cancelled. Resolves true once the song is in the cache, false if both fail.
+// Background downloads (prefetches, the queue's next songs, the playlist sync) run one at a time:
+// each song takes one yt-dlp instance per sign-in mode and the worker has two, so one stays free for
+// a song someone clicks. Waiting ones go in order, likely picks (urgent) first; a click on a song
+// still waiting for its turn starts it at once (promote).
+let backgroundTurnHeld = false;
+const backgroundTurnQueue = []; // { urgent, take } oldest first, urgent ones ahead
+function waitForBackgroundTurn(urgent = false) {
+  const turn = { promoted: false, holding: false };
+  let release;
+  turn.ready = new Promise(r => { release = r; });
+  const waiter = { urgent, take: () => { turn.holding = true; release(); } };
+  if (!backgroundTurnHeld) {
+    backgroundTurnHeld = true;
+    waiter.take();
+  } else {
+    const at = urgent ? backgroundTurnQueue.findIndex(w => !w.urgent) : -1;
+    backgroundTurnQueue.splice(at < 0 ? backgroundTurnQueue.length : at, 0, waiter);
+  }
+  turn.promote = () => {
+    const i = backgroundTurnQueue.indexOf(waiter);
+    if (i < 0) return; // already running
+    backgroundTurnQueue.splice(i, 1);
+    turn.promoted = true;
+    release();
+  };
+  turn.end = () => {
+    if (!turn.holding) return;
+    turn.holding = false;
+    const next = backgroundTurnQueue.shift();
+    if (next) next.take(); else backgroundTurnHeld = false;
+  };
+  return turn;
+}
+
 function workerDownloadToCache(worker, vid, format, meta, priority = 0) {
   return new Promise((resolve) => {
     const runs = [];
@@ -3229,6 +3264,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   const forShare = Boolean(parsedUrl.query && parsedUrl.query.forShare === '1');
   const forceYtDlp = Boolean(parsedUrl.query && parsedUrl.query.forceYtDlp === '1');
   const background = Boolean(parsedUrl.query && parsedUrl.query.prefetch === '1'); // a prefetch: nobody is waiting yet
+  const urgent = Boolean(parsedUrl.query && parsedUrl.query.urgent === '1'); // a likely pick: first in the background line
   const quality = (parsedUrl.query && parsedUrl.query.quality) || 'medium';
   const queryQ = (parsedUrl.query && parsedUrl.query.q) ? String(parsedUrl.query.q).trim() : '';
   let cleanId = cleanTrackId(trackId);
@@ -3321,6 +3357,8 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   }
 
   if (!forceYtDlp && streamInfoInflight.has(cacheKey)) {
+    // A background lookup of this song is under way: someone is waiting for it now.
+    if (!background && streamInfoPromoters.has(cacheKey)) streamInfoPromoters.get(cacheKey)();
     const inflightUrl = await streamInfoInflight.get(cacheKey).catch(() => null);
     if (inflightUrl && inflightUrl.includes('/api/local-track?')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3352,6 +3390,11 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   let resolveInflight, rejectInflight;
   const inflightPromise = new Promise((res, rej) => { resolveInflight = res; rejectInflight = rej; });
   streamInfoInflight.set(cacheKey, inflightPromise);
+  // A background lookup moves to the front if someone asks for the same song meanwhile.
+  let promoteRequested = false;
+  let promoteDownload = null;
+  const promoteThis = () => { promoteRequested = true; if (promoteDownload) promoteDownload(); };
+  if (background) streamInfoPromoters.set(cacheKey, promoteThis);
 
   try {
     needYtAuth = false;
@@ -3415,7 +3458,11 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       if (!vid) return null;
       const localUrl = `http://127.0.0.1:${ACTIVE_PORT}/api/local-track?id=${encodeURIComponent(vid)}`;
       if (await findCachedFile(vid)) return localUrl;
-      if (ytDownloadsInFlight.has(vid)) return (await ytDownloadsInFlight.get(vid)) ? localUrl : null;
+      if (ytDownloadsInFlight.has(vid)) {
+        const inflight = ytDownloadsInFlight.get(vid);
+        if (!background && typeof inflight.promote === 'function') inflight.promote(); // someone is waiting now
+        return (await inflight) ? localUrl : null;
+      }
       const format = quality === 'low' ? 'wa[ext=m4a]/wa/ba'
         : (quality === 'high' || quality === 'max') ? 'ba'
         : 'ba[ext=m4a]/ba';
@@ -3423,7 +3470,17 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       const worker = getYtWorker();
       if (worker) {
         const meta = { title, artist, duration, thumbnail };
-        const started = workerDownloadToCache(worker, vid, format, meta, background ? 1 : 0);
+        const turn = background && !promoteRequested ? waitForBackgroundTurn(urgent) : null;
+        const started = (async () => {
+          if (turn) await turn.ready;
+          try {
+            return await workerDownloadToCache(worker, vid, format, meta, turn && !turn.promoted ? 1 : 0);
+          } finally {
+            if (turn) turn.end();
+          }
+        })();
+        started.promote = () => { if (turn) turn.promote(); };
+        promoteDownload = started.promote;
         ytDownloadsInFlight.set(vid, started);
         try {
           if (await started) return localUrl;
@@ -3756,6 +3813,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
     rejectInflight(e);
   } finally {
     streamInfoInflight.delete(cacheKey);
+    if (streamInfoPromoters.get(cacheKey) === promoteThis) streamInfoPromoters.delete(cacheKey);
   }
 
   if (forShare) {
@@ -5972,17 +6030,24 @@ const REMOTE_INFO_PATH = path.join(DATA_DIR, 'remote.json');
 const REMOTE_ACTIONS = new Set([
   'toggle', 'play', 'pause', 'next', 'prev', 'seek', 'volume', 'mute', 'shuffle', 'repeat', 'like',
   'playTrack', 'queueTrack', 'playNextTrack', 'playList', 'playQueueIndex', 'show',
-  'addToPlaylist', 'startRadio', 'myWave', 'removeFromQueue', 'moveToNext', 'clearUpcoming', 'sleep', 'download'
+  'addToPlaylist', 'startRadio', 'myWave', 'removeFromQueue', 'moveToNext', 'clearUpcoming', 'sleep', 'download',
+  'playNextList', 'saveQueueAsPlaylist'
 ]);
 
 // Background stream lookups for songs someone is likely to pick next (the top search results, the
 // start of an album), so that by the time one is picked, YouTube's lookup and its five-second
-// wait are already done. A few run at once at low priority (the yt-dlp worker serves songs
-// someone is waiting for first); only the latest few requests are kept.
+// wait are already done. One runs at a time, likeliest first, ahead of the other background
+// downloads (see waitForBackgroundTurn); only the latest few requests are kept.
 const remotePrefetchQueue = [];
 const remotePrefetchKeys = new Set();
-const PREFETCH_CONCURRENCY = 3;
+const PREFETCH_CONCURRENCY = 1;
 let remotePrefetchRunning = 0;
+
+// Forgets prefetches that have not started, when newer likely picks replace them (a new search).
+function clearRemotePrefetchQueue() {
+  remotePrefetchQueue.length = 0;
+  remotePrefetchKeys.clear();
+}
 
 function queueRemotePrefetch(track) {
   if (!forkSetting('prefetch')) return;
@@ -5996,8 +6061,8 @@ function queueRemotePrefetch(track) {
 }
 
 // Resolves a track's stream (downloading it into the cache) as the player would, at low priority,
-// without anyone waiting on the answer.
-async function fetchTrackInBackground(track) {
+// without anyone waiting on the answer. urgent: a likely pick, first in the background line.
+async function fetchTrackInBackground(track, urgent = false) {
   // handleStreamInfo answers through a response object; this one just swallows the answer.
   const sink = new (require('events').EventEmitter)();
   Object.assign(sink, {
@@ -6007,6 +6072,7 @@ async function fetchTrackInBackground(track) {
     end() { this.writableEnded = true; this.emit('finish'); this.emit('close'); }
   });
   const query = { q: `${track.artist || ''} ${track.title || ''}`.trim(), quality: track.quality || 'medium', prefetch: '1' };
+  if (urgent) query.urgent = '1';
   const fakeReq = { url: '/api/stream-info?' + new URLSearchParams(query).toString(), headers: {} };
   try {
     await handleStreamInfo(fakeReq, sink, track.url || '', track.id || '', track.platform || 'ytmusic',
@@ -6020,7 +6086,7 @@ async function runRemotePrefetch() {
   try {
     while (remotePrefetchQueue.length > 0) {
       const { key, track } = remotePrefetchQueue.shift();
-      await fetchTrackInBackground(track);
+      await fetchTrackInBackground(track, true);
       remotePrefetchKeys.delete(key);
     }
   } finally {
@@ -9635,6 +9701,7 @@ async function requestHandler(req, res) {
     req.on('data', chunk => { body += chunk; if (body.length > 262144) req.destroy(); });
     req.on('end', () => {
       const payload = safeJsonParse(body, {});
+      clearRemotePrefetchQueue(); // the previous search's picks that have not started
       (Array.isArray(payload.tracks) ? payload.tracks.slice(0, 5) : []).forEach(queueRemotePrefetch);
       res.writeHead(202, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));

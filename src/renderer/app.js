@@ -4412,7 +4412,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       const qQuality = encodeURIComponent(curQuality);
       const qFallback = encodeURIComponent(nextTrack.searchQuery || ((nextTrack.artist ? nextTrack.artist + ' - ' : '') + (nextTrack.title || '')));
-      const fetchUrl = `http://127.0.0.1:${state.serverPort}/api/stream-info?id=${encodeURIComponent(nextTrack.id || '')}&url=${encodeURIComponent(nextTrack.url || '')}&platform=${encodeURIComponent(nextTrack.platform || 'ytmusic')}&title=${encodeURIComponent(nextTrack.title || '')}&artist=${encodeURIComponent(nextTrack.artist || '')}&duration=${encodeURIComponent(nextTrack.duration || 0)}&q=${qFallback}&quality=${qQuality}`;
+      // prefetch=1: a background download, so a song picked meanwhile is fetched first.
+      const fetchUrl = `http://127.0.0.1:${state.serverPort}/api/stream-info?id=${encodeURIComponent(nextTrack.id || '')}&url=${encodeURIComponent(nextTrack.url || '')}&platform=${encodeURIComponent(nextTrack.platform || 'ytmusic')}&title=${encodeURIComponent(nextTrack.title || '')}&artist=${encodeURIComponent(nextTrack.artist || '')}&duration=${encodeURIComponent(nextTrack.duration || 0)}&q=${qFallback}&quality=${qQuality}&prefetch=1`;
       const res = await fetch(fetchUrl);
       const data = await res.json();
       if (data && data.success && data.streamUrl) {
@@ -18820,6 +18821,34 @@ function bindCoverHoldZoom(wrapEl) {
         if (command.kind === 'playlist' && command.id) rememberRecentList({ kind: 'playlist', id: command.id });
         else if (command.kind === 'liked') rememberRecentList({ kind: 'liked' });
         else if (command.kind === 'tracks' && command.album && command.album.title) rememberRecentList({ kind: 'album', album: command.album });
+        break;
+      }
+      case 'playNextList': {
+        // A whole list (a playlist, the liked songs, or songs the caller sends, such as an album)
+        // after the current song; with nothing playing it just plays.
+        const source = command.kind === 'tracks' && Array.isArray(command.tracks)
+          ? command.tracks.map(remoteTrack).filter(Boolean)
+          : remoteListTracks(command.kind, command.id);
+        if (!Array.isArray(source) || source.length === 0) break;
+        const tracks = source.slice();
+        if (!state.currentTrack || state.queue.length === 0) {
+          playTrack(tracks[0], tracks, 0, command.kind === 'playlist' ? 'playlist' : command.kind);
+          break;
+        }
+        state.queue.splice(state.queueIndex + 1, 0, ...tracks);
+        updateQueueBadge();
+        if (state.currentView === 'queue') renderQueueView();
+        showToast(`${tracks.length} ${tracks.length === 1 ? 'song plays' : 'songs play'} next`, 'success');
+        break;
+      }
+      case 'saveQueueAsPlaylist': {
+        const name = String(command.name || '').trim();
+        const tracks = (state.queue || []).map(remoteTrack).filter(Boolean).map(stampAddedAt);
+        if (!name || tracks.length === 0) break;
+        state.playlists.push({ id: 'pl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name, tracks });
+        localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
+        renderPlaylistsList();
+        showToast(`Saved the queue as "${name}"`, 'success');
         break;
       }
       case 'playQueueIndex': {
