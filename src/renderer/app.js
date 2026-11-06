@@ -4498,6 +4498,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     applyTrackRenames(track);
     if (typeof queueList === "number") { startIndex = queueList; queueList = state.queue; }
     if (!track || !el.nativeAudio) return;
+    if (Array.isArray(queueList) && queueList !== state.queue) rememberRecentListFromView(track, context);
     const selectedQuality = localStorage.getItem('riff_audio_quality') || 'medium';
     if (track._preloadedStreamQuality && track._preloadedStreamQuality !== selectedQuality) {
       delete track._preloadedStreamUrl;
@@ -9361,6 +9362,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    if (album.type !== 'Daily Mix') rememberRecentList({ kind: 'album', album });
     playTrack(firstResolved, [firstResolved], 0, 'album');
 
     const hasBusy = typeof beginBusy === 'function';
@@ -9530,6 +9532,54 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function updateAlbumsCount() {
     setNavCount(document.getElementById('albums-count'), getSavedAlbums().length);
+  }
+
+  // ---- recently played lists (the sidebar's Recent tab) ----------------------------------------
+  // Playlists, albums and the liked songs, newest first, each once.
+  const RECENT_LISTS_KEY = 'riff_recent_lists';
+  const RECENT_LISTS_MAX = 30;
+
+  function getRecentLists() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(RECENT_LISTS_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // entry: { kind: 'playlist', id } | { kind: 'album', album } | { kind: 'liked' }
+  function rememberRecentList(entry) {
+    if (!entry || !entry.kind) return;
+    const key = entry.kind === 'album'
+      ? `album:${entry.album.id || `${entry.album.artist}::${entry.album.title}`}`
+      : `${entry.kind}:${entry.id || ''}`;
+    const item = { key, kind: entry.kind, at: Date.now() };
+    if (entry.kind === 'playlist') item.id = entry.id;
+    if (entry.kind === 'album') {
+      const a = entry.album;
+      item.album = { id: a.id || '', title: a.title || '', artist: a.artist || '', cover: a.cover || '', year: a.year || '', type: a.type || 'Album' };
+    }
+    const list = getRecentLists().filter(r => r.key !== key);
+    list.unshift(item);
+    try { localStorage.setItem(RECENT_LISTS_KEY, JSON.stringify(list.slice(0, RECENT_LISTS_MAX))); } catch (_) {}
+    // (currentSidebarLibFilter is declared further down; a song resumed during start-up gets here first.)
+    try { if (currentSidebarLibFilter === 'recent') renderSidebarLibraryFeed(); } catch (_) {}
+  }
+
+  // When a new list starts playing, remembers the playlist, album or liked songs it came from,
+  // judged by what is open; the song must belong to it, so radio, search or My Wave started
+  // while a playlist is open are not counted.
+  function rememberRecentListFromView(track, context) {
+    if (!track || context === 'radio' || context === 'search' || context === 'sidebar-pinned') return;
+    if (state.currentView === 'album' && context === 'album' && state.currentAlbum && state.currentAlbum.type !== 'Daily Mix') {
+      rememberRecentList({ kind: 'album', album: state.currentAlbum });
+    } else if (state.currentView === 'playlist-detail' && state.currentPlaylist
+      && (state.currentPlaylist.tracks || []).some(t => isSameTrack(t, track))) {
+      rememberRecentList({ kind: 'playlist', id: state.currentPlaylist.id });
+    } else if (state.currentView === 'favorites' && (state.favorites || []).some(t => isSameTrack(t, track))) {
+      rememberRecentList({ kind: 'liked' });
+    }
   }
 
   const isSameAlbum = (a, album) => (album.id && a.id === album.id) || (album.title && a.title === album.title && a.artist === album.artist);
@@ -18588,6 +18638,10 @@ function bindCoverHoldZoom(wrapEl) {
           index = 0;
         }
         playTrack(tracks[index], tracks, index, command.kind === 'playlist' ? 'playlist' : command.kind);
+        // Listed under Recent like a list started in the window (an album play names its album).
+        if (command.kind === 'playlist' && command.id) rememberRecentList({ kind: 'playlist', id: command.id });
+        else if (command.kind === 'liked') rememberRecentList({ kind: 'liked' });
+        else if (command.kind === 'tracks' && command.album && command.album.title) rememberRecentList({ kind: 'album', album: command.album });
         break;
       }
       case 'playQueueIndex': {
@@ -27813,6 +27867,7 @@ function bindCoverHoldZoom(wrapEl) {
       getSidebarPinnedTracks().map(t => t.id || t.title).join(','),
       (state.playlists || []).map(p => `${p.id}:${p.name}:${(p.tracks || []).length}:${p.cover || ''}`).join('|'),
       (typeof getSavedAlbums === 'function' ? getSavedAlbums() : []).map(a => a.id || a.title).join(','),
+      currentSidebarLibFilter === 'recent' ? getRecentLists().map(r => r.key).join(',') : '',
       currentSidebarLibFilter === 'queue' ? `${state.currentTrack?.id || ''}:${state.queueIndex}:${(state.queue || []).length}:${(state.history || []).length}` : ''
     ].join('::');
     if (!forceAnim && feed._lastSig === sigParts && feed.children.length > 0) {
@@ -27959,6 +28014,65 @@ function bindCoverHoldZoom(wrapEl) {
           row.addEventListener('click', () => openAlbum(alb));
           frag.appendChild(row);
         });
+      }
+    } else if (currentSidebarLibFilter === 'recent') {
+      // Playlists, albums and the liked songs played lately, newest first. A deleted playlist is skipped.
+      let shown = 0;
+      getRecentLists().forEach(rec => {
+        const row = document.createElement('div');
+        row.className = 'sb-lib-row';
+        if (!forceAnim) row.classList.add('no-sb-anim');
+        const coverBox = document.createElement('div');
+        coverBox.className = 'sb-lib-cover';
+        let title = '';
+        let sub = '';
+        if (rec.kind === 'playlist') {
+          const pl = (state.playlists || []).find(p => p.id === rec.id);
+          if (!pl) return;
+          row.dataset.playlistId = pl.id;
+          row.classList.toggle('active', state.currentView === 'playlist-detail' && state.currentPlaylistId === pl.id);
+          renderPlaylistCover(coverBox, pl, 60);
+          const cnt = (pl.tracks || []).length;
+          title = pl.name || 'Untitled';
+          sub = `${t('Playlist')} · ${cnt} ${cnt === 1 ? 'track' : 'tracks'}`;
+          row.addEventListener('click', () => openPlaylistDetail(pl.id));
+        } else if (rec.kind === 'album' && rec.album) {
+          const alb = rec.album;
+          coverBox.innerHTML = alb.cover
+            ? `<img src="${escapeHtml(alb.cover)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+            : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>';
+          title = alb.title || 'Album';
+          sub = [t('Album'), alb.artist].filter(Boolean).join(' · ');
+          row.addEventListener('click', () => openAlbum(alb));
+          row.addEventListener('contextmenu', (e) => openAlbumContextMenu(e, alb));
+        } else if (rec.kind === 'liked') {
+          row.dataset.viewTarget = 'favorites';
+          row.classList.toggle('active', state.currentView === 'favorites');
+          coverBox.classList.add('liked-grad');
+          coverBox.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>';
+          const favCount = (state.favorites || []).length;
+          title = t('Liked songs');
+          sub = `${favCount} ${favCount === 1 ? 'song' : 'songs'}`;
+          row.addEventListener('click', () => switchView('favorites'));
+        } else {
+          return;
+        }
+        const info = document.createElement('div');
+        info.className = 'sb-lib-info';
+        info.innerHTML = `
+          <span class="sb-lib-title">${escapeHtml(title)}</span>
+          <span class="sb-lib-sub">${escapeHtml(sub)}</span>
+        `;
+        row.append(coverBox, info);
+        frag.appendChild(row);
+        shown++;
+      });
+      if (shown === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-hint';
+        empty.style.padding = '28px 12px';
+        empty.textContent = t('Playlists and albums you play show up here');
+        frag.appendChild(empty);
       }
     } else if (currentSidebarLibFilter === 'queue') {
       if (state.currentTrack) {
