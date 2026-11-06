@@ -17316,14 +17316,14 @@ function bindCoverHoldZoom(wrapEl) {
     return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
   }
 
-  // The line and bar under "Keep playlist songs downloaded".
+  // The line and bar under "Keep playlist songs downloaded" and "Keep saved albums downloaded".
   function showPlaylistSyncProgress(status) {
     const text = document.getElementById('fork-sync-text');
     const bar = document.getElementById('fork-sync-bar');
     if (!text || !bar || !status) return;
     const { songs, downloaded, enabled, running, current, secondsLeft } = status;
     let line;
-    if (!songs) line = 'No songs in your playlists or liked songs yet';
+    if (!songs) line = 'No songs in your playlists, liked songs or saved albums yet';
     else if (running) {
       line = `${downloaded} of ${songs} downloaded`;
       if (current) line += ` · now: ${current.title}${current.artist ? ' — ' + current.artist : ''}`;
@@ -17396,7 +17396,7 @@ function bindCoverHoldZoom(wrapEl) {
           if (await saveForkSetting(s.key, next)) btn.classList.toggle('active', next);
         });
         top.appendChild(btn);
-        if (s.key === 'keepPlaylistsDownloaded') {
+        if (s.key === 'keepAlbumsDownloaded') { // the progress of both "keep downloaded" switches, under the second
           const progress = document.createElement('div');
           progress.style.cssText = 'margin-top: 10px;';
           progress.innerHTML =

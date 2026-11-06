@@ -439,6 +439,7 @@ function findCachedFileByMeta(title, artist) {
 const FORK_SETTINGS_PATH = path.join(DATA_DIR, 'fork-settings.json');
 const FORK_SETTINGS = {
   keepPlaylistsDownloaded: { default: false, label: 'Keep playlist songs downloaded', description: 'Download every song in your playlists and liked songs, and never remove them from the cache' },
+  keepAlbumsDownloaded: { default: false, label: 'Keep saved albums downloaded', description: 'Download every song of the albums in your Albums tab, and never remove them from the cache' },
   prefetch: { default: true, label: 'Prefetch likely picks', description: 'Start loading the top search results and the first songs of albums and artists while they are on screen' },
   raceLookups: { default: true, label: 'Two lookups per song', description: 'Fetch each new song signed in and anonymous at once and keep the faster one (fewer slow songs, twice the requests)' },
   signedInSearch: { default: true, label: 'Signed-in YouTube Music search', description: 'Send your YouTube sign-in with searches (YouTube Music refuses fewer of them)' },
@@ -488,13 +489,13 @@ async function pruneDiskCache() {
       } catch (e) {}
     }
     // Keep the cache under its limit by removing the songs played longest ago (findCachedFile
-    // touches a song's time each time it is played). With "keep playlist songs downloaded" on,
-    // songs in playlists or the liked songs are never removed and don't count toward the limit,
-    // and until the library is known (right after start, or the server running on its own)
-    // nothing is removed.
+    // touches a song's time each time it is played). With "keep playlist songs downloaded" or
+    // "keep saved albums downloaded" on, those songs are never removed and don't count toward
+    // the limit, and until the library is known (right after start, or the server running on
+    // its own) nothing is removed.
     let pinned = new Set();
-    if (forkSetting('keepPlaylistsDownloaded')) {
-      const pinnedTracks = typeof playlistTracks === 'function' ? playlistTracks() : null;
+    if (keepingSongsDownloaded()) {
+      const pinnedTracks = keptTracks();
       if (!pinnedTracks) return;
       pinned = pinnedCacheIds(pinnedTracks);
     }
@@ -5991,6 +5992,84 @@ function playlistTracks() {
   return data.tracks.filter(t => t && t.title && t.platform !== 'local');
 }
 
+// ---- saved albums stay downloaded ---------------------------------------------------------
+// A saved album only keeps its name and cover, so its songs are looked up once (the way the album
+// page does) and remembered in the data folder.
+const SAVED_ALBUM_TRACKS_PATH = path.join(DATA_DIR, 'saved-album-tracks.json');
+let savedAlbumTrackLists = {}; // album key -> its songs
+try { savedAlbumTrackLists = JSON.parse(fs.readFileSync(SAVED_ALBUM_TRACKS_PATH, 'utf8')) || {}; } catch (_) {}
+const albumKey = (a) => String(a.id || `${a.artist}::${a.title}`).toLowerCase();
+
+// The Albums tab (null when the library is not available).
+function savedAlbums() {
+  const data = remoteHandlers.library ? remoteHandlers.library('savedAlbums', '') : null;
+  return data && Array.isArray(data.albums) ? data.albums : null;
+}
+
+// One album's songs, through the album page's own lookup (handleAlbumTracks answers through a
+// response object, so this one collects the answer).
+function lookupAlbumTracks(album) {
+  return new Promise((resolve) => {
+    const query = { id: album.id || '', title: album.title || '', artist: album.artist || '' };
+    const sink = {
+      writeHead() {},
+      end(body) {
+        const data = safeJsonParse(body, null);
+        resolve(data && data.success && Array.isArray(data.tracks) ? data.tracks : null);
+      }
+    };
+    handleAlbumTracks({ headers: {} }, sink, { query }).catch(() => resolve(null));
+  });
+}
+
+// Looks up the songs of saved albums not seen before, and forgets albums no longer saved.
+async function refreshSavedAlbumTracks() {
+  const albums = savedAlbums();
+  if (!albums) return;
+  const keys = new Set(albums.map(albumKey));
+  let changed = false;
+  for (const key of Object.keys(savedAlbumTrackLists)) {
+    if (!keys.has(key)) { delete savedAlbumTrackLists[key]; changed = true; }
+  }
+  for (const album of albums) {
+    const key = albumKey(album);
+    if (savedAlbumTrackLists[key]) continue;
+    const tracks = await lookupAlbumTracks(album);
+    // Apple's catalogue refuses lookups sent back to back, so they are spaced out.
+    await new Promise(r => setTimeout(r, 3000));
+    if (!tracks || !tracks.length) continue; // tried again on the next sync
+    // No id: these are catalogue ids, not YouTube ones, so the songs are found by artist and title.
+    savedAlbumTrackLists[key] = tracks.filter(t => t && t.title).map(t => ({
+      id: '', title: t.title, artist: t.artist || album.artist || '', duration: t.duration || 0,
+      thumbnail: t.thumbnail || album.cover || '', platform: 'ytmusic'
+    }));
+    changed = true;
+  }
+  if (changed) try { fs.writeFileSync(SAVED_ALBUM_TRACKS_PATH, JSON.stringify(savedAlbumTrackLists)); } catch (_) {}
+}
+
+// Songs of the saved albums looked up so far (null when the library is not available).
+function savedAlbumTracks() {
+  const albums = savedAlbums();
+  if (!albums) return null;
+  return albums.flatMap(a => savedAlbumTrackLists[albumKey(a)] || []);
+}
+
+const keepingSongsDownloaded = () => !!(forkSetting('keepPlaylistsDownloaded') || forkSetting('keepAlbumsDownloaded'));
+
+// The songs kept downloaded: the playlist and liked songs and the saved albums' songs, each while
+// its switch is on (null when the library is not available).
+function keptTracks() {
+  const tracks = [];
+  for (const [key, source] of [['keepPlaylistsDownloaded', playlistTracks], ['keepAlbumsDownloaded', savedAlbumTracks]]) {
+    if (!forkSetting(key)) continue;
+    const list = source();
+    if (!list) return null;
+    tracks.push(...list);
+  }
+  return tracks;
+}
+
 // Cache ids (file names without extension) that belong to playlist songs.
 function pinnedCacheIds(tracks) {
   const keys = new Set(tracks.map(t => trackKey(t.artist, t.title)));
@@ -6009,7 +6088,8 @@ let playlistStatusCache = { at: 0, value: null };
 // checks every song's file, so it is reused for a few seconds.
 function playlistSyncStatus() {
   if (Date.now() - playlistStatusCache.at > 3000) {
-    const tracks = playlistTracks();
+    // With both switches off, the count still shows how much of the playlists is downloaded.
+    const tracks = keepingSongsDownloaded() ? keptTracks() : playlistTracks();
     let songs = 0;
     let downloaded = 0;
     const failedSongs = [];
@@ -6037,7 +6117,7 @@ function playlistSyncStatus() {
   const p = playlistSyncProgress;
   const perSong = p.done > 0 ? (Date.now() - p.startedAt) / p.done : 10000;
   return Object.assign({}, playlistStatusCache.value, {
-    enabled: !!forkSetting('keepPlaylistsDownloaded'),
+    enabled: keepingSongsDownloaded(),
     running: p.running,
     queued: p.queued,
     done: p.done,
@@ -6048,11 +6128,12 @@ function playlistSyncStatus() {
 }
 
 async function syncPlaylistDownloads() {
-  if (playlistSyncRunning || !forkSetting('keepPlaylistsDownloaded')) return;
-  const tracks = playlistTracks();
-  if (!tracks) return;
+  if (playlistSyncRunning || !keepingSongsDownloaded()) return;
   playlistSyncRunning = true;
   try {
+    if (forkSetting('keepAlbumsDownloaded')) await refreshSavedAlbumTracks();
+    const tracks = keptTracks();
+    if (!tracks) return;
     const cachedByKey = new Map();
     for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
       if (meta && meta.title) cachedByKey.set(trackKey(meta.artist, meta.title), cid);
@@ -6071,7 +6152,7 @@ async function syncPlaylistDownloads() {
     if (missing.length) try { logger.log('info', `playlist sync: fetching ${missing.length} songs`); } catch (_) {}
     Object.assign(playlistSyncProgress, { running: missing.length > 0, queued: missing.length, done: 0, failed: 0, current: null, startedAt: Date.now() });
     for (const t of missing) {
-      if (!forkSetting('keepPlaylistsDownloaded')) break; // switched off part-way
+      if (!keepingSongsDownloaded()) break; // switched off part-way
       playlistSyncProgress.current = { title: t.title, artist: t.artist || '' };
       await fetchTrackInBackground(t);
       const ok = hasCachedAudio(cleanTrackId(t.id || '')) || !!findCachedFileByMeta(t.title, t.artist);
@@ -6150,7 +6231,10 @@ function handleForkSettings(req, res) {
   req.on('end', () => {
     const change = safeJsonParse(body, null);
     if (!change || !setForkSetting(change.key, change.value)) return send(400, { success: false, error: 'unknown setting or bad value' });
-    if (change.key === 'keepPlaylistsDownloaded' && change.value) syncPlaylistDownloads().catch(() => {});
+    if ((change.key === 'keepPlaylistsDownloaded' || change.key === 'keepAlbumsDownloaded') && change.value) {
+      playlistStatusCache.at = 0;
+      syncPlaylistDownloads().catch(() => {});
+    }
     if (change.key === 'cacheLimitGB') pruneDiskCache();
     return send(200, { success: true, key: change.key, value: forkSetting(change.key) });
   });

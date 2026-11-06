@@ -402,6 +402,13 @@ function runGUI() {
       for (const p of list('devsize_playlists')) if (Array.isArray(p.tracks)) all.push(...p.tracks);
       return { name: 'Playlist songs', tracks: all.filter(Boolean).map(slim) };
     }
+    if (kind === 'savedAlbums') { // the Albums tab; their songs are looked up by the server
+      return {
+        albums: list('riff_saved_albums').filter(a => a && (a.id || a.title)).map(a => ({
+          id: a.id || '', title: a.title || '', artist: a.artist || '', cover: a.cover || ''
+        }))
+      };
+    }
     if (kind === 'local') {
       const files = list('riff_local_files').length > 0 ? list('riff_local_files') : list('riff_local_tracks');
       let removed = [];
