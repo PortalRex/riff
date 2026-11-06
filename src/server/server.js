@@ -413,8 +413,54 @@ async function findCachedFile(trackId) {
   return null;
 }
 
+const trackKey = (artist, title) => `${String(artist || '').toLowerCase().trim()}::${String(title || '').toLowerCase().trim()}`;
+
+// Songs whose video is cached under another song's name: the same recording is often in a playlist
+// and on an album with different titles ("Real" and "Real (feat. Anna Wise)"), and the cache keeps
+// one name per file. Song key -> cache id, kept in the data folder.
+const SONG_FILES_PATH = path.join(DATA_DIR, 'song-files.json');
+let songFiles = {};
+try { songFiles = JSON.parse(fs.readFileSync(SONG_FILES_PATH, 'utf8')) || {}; } catch (_) {}
+
+function cachedAudioPath(cid) {
+  if (!cid) return null;
+  for (const ext of ['.opus', '.webm', '.m4a', '.mp3']) {
+    const fp = path.join(CACHE_DIR, `${cid}${ext}`);
+    if (fs.existsSync(fp)) return fp;
+  }
+  return null;
+}
+
+// The cache id of a song's file kept under another name, or of the video picked for it (see
+// handleSongMatch); null when there is none.
+function songFileFor(artist, title) {
+  if (!title) return null;
+  const key = trackKey(artist, title);
+  const cid = (songMatches[key] && songMatches[key].videoId) || songFiles[key];
+  return cid && cachedAudioPath(cid) ? cid : null;
+}
+
+// Remembers which file a song played from, when the file is saved under another song's name.
+function rememberSongFile(artist, title, cid) {
+  if (!title || !cid) return;
+  const key = trackKey(artist, title);
+  const meta = trackMetadataIndex[cid];
+  if (meta && meta.title && trackKey(meta.artist, meta.title) === key) return; // found by its own name
+  if (songFiles[key] === cid) return;
+  songFiles[key] = cid;
+  try { fs.writeFileSync(SONG_FILES_PATH, JSON.stringify(songFiles, null, 2)); } catch (_) {}
+}
+
+function forgetSongFile(key) {
+  if (!(key in songFiles)) return;
+  delete songFiles[key];
+  try { fs.writeFileSync(SONG_FILES_PATH, JSON.stringify(songFiles, null, 2)); } catch (_) {}
+}
+
 function findCachedFileByMeta(title, artist) {
   if (!title) return null;
+  const aliased = songFileFor(artist, title);
+  if (aliased) return cachedAudioPath(aliased);
   const targetTitle = title.toLowerCase().trim();
   const targetArtist = (artist || '').toLowerCase().trim();
   for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
@@ -3189,6 +3235,14 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   if (!cleanId && trackUrl && trackUrl.includes('v=')) {
     cleanId = cleanTrackId(trackUrl.split('v=')[1].split('&')[0]);
   }
+  // A video picked by hand for this song (see handleSongMatch) wins over the song's own id, files
+  // cached under its name and the search.
+  const pickedMatch = platform !== 'soundcloud' ? songMatchFor(artist, title) : null;
+  if (pickedMatch) {
+    cleanId = pickedMatch.videoId;
+    trackUrl = '';
+    platform = 'youtube';
+  }
   const isRealYtId = Boolean(extractYtIdFromAny(cleanId));
   if (!isRealYtId && trackUrl && /cand_|dz_|it_|sp_|ym_/i.test(trackUrl)) {
     trackUrl = '';
@@ -3206,7 +3260,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   const meta = { title, artist, duration, thumbnail };
 
   let cachedFile = cleanId ? await findCachedFile(cleanId) : null;
-  if (!cachedFile && (title || artist)) {
+  if (!cachedFile && !pickedMatch && (title || artist)) {
     cachedFile = findCachedFileByMeta(title, artist);
     if (cachedFile) {
       // The file is named after the id it was cached under, which can differ from this request's id.
@@ -3219,7 +3273,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       }));
     }
   }
-  const downloadedName = (title || artist) ? await findDownloadedFile(title, artist) : null;
+  const downloadedName = (!pickedMatch && (title || artist)) ? await findDownloadedFile(title, artist) : null;
 
   if (!forShare && cachedFile) {
     const cachedId = path.basename(cachedFile, path.extname(cachedFile));
@@ -3323,6 +3377,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       streamInfoInflight.delete(cacheKey);
       const finalId = resolvedId || cleanId;
       if (resolvedStreamUrl.includes('/api/local-track?')) {
+        if (title && cachedAudioPath(finalId)) rememberSongFile(artist, title, finalId);
         const data = { success: true, isLocal: true, streamUrl: resolvedStreamUrl };
         if (resolvedId) data.resolvedId = resolvedId;
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3530,17 +3585,23 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
     };
 
     const failedYtIds = new Set();
+    // The videos this lookup tries and how each went, kept so a wrong or failed match can be checked.
+    const attemptLog = [];
+    if (!forShare && title) rememberMatchAttempt(artist, title, attemptLog);
 
     if (platform === 'soundcloud' || isSc) {
       streamUrl = await resolveScCandidateStream(trackUrl, cleanId);
       if (streamUrl) return sendStreamResponse(streamUrl);
     } else if (isRealYtId && cleanId) {
       streamUrl = await resolveYtCandidateStream(cleanId);
+      attemptLog.push({ id: cleanId, title: pickedMatch ? pickedMatch.title : title, channel: pickedMatch ? pickedMatch.channel : '',
+        duration: pickedMatch ? pickedMatch.duration : Number(duration) || 0,
+        result: streamUrl && streamUrl.includes('/api/local-track?') ? 'used' : 'would not download' }); // else SoundCloud stood in
       if (streamUrl) return sendStreamResponse(streamUrl, cleanId);
       failedYtIds.add(cleanId);
     }
 
-    if (!cachedFile && (title || artist)) {
+    if (!cachedFile && !pickedMatch && (title || artist)) {
       cachedFile = findCachedFileByMeta(title, artist);
       if (cachedFile) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3552,7 +3613,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       }
     }
 
-    if (!streamUrl && searchQ) {
+    if (!streamUrl && searchQ && !pickedMatch) { // a picked video that fails is not swapped for another
       const maxCand = needYtAuth ? 1 : 3;
       const needScRace = failedYtIds.size > 0 || !cleanId || !isRealYtId;
       const scFallback = needScRace
@@ -3570,16 +3631,23 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
             candidates.set(candidate.id, candidate);
           }
         }
-        const rankedCandidates = Array.from(candidates.values())
+        const allRanked = Array.from(candidates.values())
           .map(cand => ({ cand, score: scoreImportedCandidate(title || searchQ, artist, duration, cand) }))
-          .sort((a, b) => b.score - a.score)
-          .slice(0, maxCand);
+          .sort((a, b) => b.score - a.score);
+        const rankedCandidates = allRanked.slice(0, maxCand);
         rankedCandidates.forEach(item => failedYtIds.add(item.cand.id));
         if (!rankedCandidates.length) throw new Error('no yt candidates');
+        const logged = new Map(allRanked.slice(0, 8).map(({ cand, score }) => {
+          const entry = { id: cand.id, title: cand.title || '', channel: stripYoutubeTopic(cand.artist || ''), duration: Number(cand.duration) || 0,
+            result: score <= -500 ? 'not the song' : 'not tried' };
+          attemptLog.push(entry);
+          return [cand.id, entry];
+        }));
         if (!forShare) {
           // Best match first, one download at a time, so the right recording wins.
           for (const { cand } of rankedCandidates) {
             const localUrl = await downloadYtToCache(cand.id);
+            if (logged.has(cand.id)) logged.get(cand.id).result = localUrl ? 'used' : 'would not download';
             if (localUrl) return { url: localUrl, id: cand.id };
           }
           throw new Error('no yt match');
@@ -3644,7 +3712,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       }
     }
 
-    if (!streamUrl) {
+    if (!streamUrl && !pickedMatch) {
       try {
         streamUrl = await fetchDirectSoundCloudStreamServer('', q || searchQ);
         if (streamUrl) return sendStreamResponse(streamUrl);
@@ -5871,6 +5939,7 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/prefetch',
   '/api/prefetch-stream',
   '/api/fork-settings',
+  '/api/song-match',
   '/api/check-cache',
   '/api/stream-info',
   '/api/track-analysis',
@@ -5965,7 +6034,6 @@ async function runRemotePrefetch() {
 // the background one at a time, and the cache limit never removes them (pruneDiskCache).
 const PLAYLIST_SYNC_EVERY_MS = 10 * 60 * 1000;
 const PLAYLIST_SYNC_RETRY_MS = 24 * 3600 * 1000; // a song that could not be fetched is tried again a day later
-const trackKey = (artist, title) => `${String(artist || '').toLowerCase().trim()}::${String(title || '').toLowerCase().trim()}`;
 // Songs that could not be fetched, kept in the data folder so the list (shown in Settings and the
 // Flow plugin) and the day's wait survive a restart.
 const PLAYLIST_SYNC_FAILED_PATH = path.join(DATA_DIR, 'playlist-sync-failed.json');
@@ -5977,6 +6045,145 @@ try {
 } catch (_) {}
 function savePlaylistSyncFailed() {
   try { fs.writeFileSync(PLAYLIST_SYNC_FAILED_PATH, JSON.stringify([...playlistSyncFailed.values()])); } catch (_) {}
+}
+
+// ---- picked matches -----------------------------------------------------------------------
+// Songs are found on YouTube by artist and title, and the best-scoring video is sometimes another
+// song, or none of them will download. The right video can be picked by hand (a song's right-click
+// menu, the failed list in Settings, the Flow plugin's rf /match); the pick is kept in the data
+// folder and always used for that song.
+const SONG_MATCHES_PATH = path.join(DATA_DIR, 'song-matches.json');
+let songMatches = {}; // track key -> { videoId, title, channel, duration, at }
+try { songMatches = JSON.parse(fs.readFileSync(SONG_MATCHES_PATH, 'utf8')) || {}; } catch (_) {}
+const songMatchFor = (artist, title) => (title ? songMatches[trackKey(stripYoutubeTopic(artist || ''), title)] || null : null);
+
+// The videos each song's latest lookup tried ({ id, title, channel, duration, result }), for the
+// match picker. Only the latest songs are kept; the sync's failed list keeps its own copy.
+const matchAttempts = new Map();
+function rememberMatchAttempt(artist, title, log) {
+  const key = trackKey(artist, title);
+  matchAttempts.delete(key);
+  matchAttempts.set(key, log);
+  if (matchAttempts.size > 300) matchAttempts.delete(matchAttempts.keys().next().value);
+}
+
+// The video a song plays from now: the picked one, its own id when that is cached, or the cached
+// file saved under its artist and title. Null when it has not been fetched yet.
+function currentSongVideo(id, artist, title) {
+  const picked = songMatchFor(artist, title);
+  if (picked) return { id: picked.videoId, picked: true, cached: hasCachedAudio(picked.videoId) };
+  const ownId = cleanTrackId(id || '');
+  if (extractYtIdFromAny(ownId) && hasCachedAudio(ownId)) return { id: ownId, picked: false, cached: true };
+  const aliased = songFileFor(artist, title);
+  if (aliased && extractYtIdFromAny(aliased)) return { id: aliased, picked: false, cached: true };
+  const key = trackKey(artist, title);
+  for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
+    if (meta && meta.title && trackKey(meta.artist, meta.title) === key && extractYtIdFromAny(cid) && hasCachedAudio(cid)) {
+      return { id: cid, picked: false, cached: true };
+    }
+  }
+  return null;
+}
+
+// Removes a song's cached files, except the video it should keep, so the next play uses the pick.
+function forgetSongFiles(key, ownId, keepId) {
+  let changed = false;
+  for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
+    if (cid === keepId) continue;
+    const ofSong = meta && meta.title && trackKey(meta.artist, meta.title) === key;
+    if (!ofSong && !(cid === ownId && !(meta && meta.title))) continue;
+    for (const ext of AUDIO_EXTS) { try { fs.unlinkSync(path.join(CACHE_DIR, cid + ext)); } catch (_) {} }
+    delete trackMetadataIndex[cid];
+    changed = true;
+  }
+  if (ownId && ownId !== keepId && !trackMetadataIndex[ownId]) {
+    for (const ext of AUDIO_EXTS) { try { fs.unlinkSync(path.join(CACHE_DIR, ownId + ext)); } catch (_) {} }
+  }
+  if (changed) try { fs.writeFileSync(METADATA_PATH, JSON.stringify(trackMetadataIndex, null, 2), 'utf-8'); } catch (_) {}
+}
+
+// YouTube Music's and YouTube's results for a search, best match for the song first.
+async function songMatchCandidates(search, title, artist, duration) {
+  const [ytmHits, ytHits] = await Promise.all([
+    ytmusicSearch(search, { timeoutMs: 6000, maxRetries: 0, fallback: false }).catch(() => []),
+    directYoutubeSearch(search, false, 12).catch(() => [])
+  ]);
+  const seen = new Map();
+  for (const c of [...(ytmHits || []), ...(ytHits || [])]) {
+    if (c && c.id && extractYtIdFromAny(c.id) && !seen.has(c.id)) seen.set(c.id, c);
+  }
+  return [...seen.values()]
+    .map(c => ({
+      id: c.id, title: c.title || '', channel: stripYoutubeTopic(c.artist || ''), duration: Number(c.duration) || 0,
+      thumbnail: c.thumbnail || `https://i.ytimg.com/vi/${c.id}/hqdefault.jpg`,
+      score: Math.round(scoreImportedCandidate(title, artist, duration, c))
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 15);
+}
+
+// GET ?title&artist&duration&id[&q]: the video the song plays from now, what its latest lookup
+// tried, and the search results to pick from (q: a search typed by hand instead of artist and
+// title). POST { title, artist, id, videoId, video: { title, channel, duration, thumbnail } } picks
+// a video for the song (videoId null forgets the pick) and fetches it in the background.
+function handleSongMatch(req, res, parsedUrl) {
+  const send = (code, payload) => {
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+  };
+  if (req.method === 'GET') {
+    const query = parsedUrl.query || {};
+    const title = String(query.title || '').trim();
+    const artist = stripYoutubeTopic(String(query.artist || '')).trim();
+    if (!title) return send(400, { success: false, error: 'missing title' });
+    const key = trackKey(artist, title);
+    const search = String(query.q || '').trim() || makeCleanSearchQuery(artist, title);
+    songMatchCandidates(search, title, artist, Number(query.duration) || 0)
+      .then(candidates => send(200, {
+        success: true, search, current: currentSongVideo(String(query.id || ''), artist, title),
+        tried: matchAttempts.get(key) || (playlistSyncFailed.get(key) || {}).tried || [], candidates
+      }))
+      .catch(err => send(500, { success: false, error: String((err && err.message) || err) }));
+    return;
+  }
+  if (req.method !== 'POST') return send(405, { success: false, error: 'GET or POST' });
+  let body = '';
+  req.on('data', chunk => { body += chunk; if (body.length > 16384) req.destroy(); });
+  req.on('end', () => {
+    const change = safeJsonParse(body, null);
+    const title = change && String(change.title || '').trim();
+    if (!title) return send(400, { success: false, error: 'missing title' });
+    const artist = stripYoutubeTopic(String(change.artist || '')).trim();
+    const key = trackKey(artist, title);
+    const videoId = change.videoId ? extractYtIdFromAny(String(change.videoId)) : null;
+    if (change.videoId && !videoId) return send(400, { success: false, error: 'not a YouTube video id' });
+    const video = (change.video && typeof change.video === 'object') ? change.video : {};
+    if (videoId) {
+      songMatches[key] = {
+        videoId, title: String(video.title || ''), channel: String(video.channel || ''), duration: Number(video.duration) || 0, at: Date.now()
+      };
+    } else {
+      delete songMatches[key];
+    }
+    try { fs.writeFileSync(SONG_MATCHES_PATH, JSON.stringify(songMatches, null, 2)); } catch (_) {}
+    forgetSongFiles(key, cleanTrackId(String(change.id || '')), videoId);
+    forgetSongFile(key); // a file kept under another song's name stays, for that song
+    streamUrlCache.clear(); // looked-up streams of the old match
+    matchAttempts.delete(key);
+    if (playlistSyncFailed.delete(key)) savePlaylistSyncFailed();
+    playlistStatusCache.at = 0;
+    const duration = Number(change.duration) || 0;
+    const thumbnail = String(change.thumbnail || '');
+    // A preview may have cached the video already, saved under no song (one saved under another
+    // song keeps that name; the pick finds it).
+    const videoMeta = videoId ? trackMetadataIndex[videoId] : null;
+    if (videoId && hasCachedAudio(videoId) && !(videoMeta && videoMeta.title)) {
+      saveTrackMetadata(videoId, { id: videoId, title, artist, duration, thumbnail, platform: 'ytmusic' });
+    }
+    // Fetched now, so the song is ready (and counted as downloaded) without waiting for the sync.
+    fetchTrackInBackground({ title, artist, duration, thumbnail, platform: 'ytmusic' }).catch(() => {});
+    return send(200, { success: true, picked: videoId ? songMatches[key] : null });
+  });
 }
 let playlistSyncRunning = false;
 let playlistSyncScheduled = false;
@@ -6077,6 +6284,10 @@ function pinnedCacheIds(tracks) {
   for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
     if (meta && meta.title && keys.has(trackKey(meta.artist, meta.title))) ids.add(cid);
   }
+  for (const key of keys) {
+    if (songFiles[key]) ids.add(songFiles[key]);
+    if (songMatches[key]) ids.add(songMatches[key].videoId);
+  }
   return ids;
 }
 
@@ -6104,11 +6315,11 @@ function playlistSyncStatus() {
         if (seen.has(key)) continue;
         seen.add(key);
         songs++;
-        if (hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(key))) downloaded++;
+        if (hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(key)) || songFileFor(t.artist, t.title)) downloaded++;
         else if (playlistSyncFailed.has(key)) {
           // Listed only while still in a playlist and still missing (playing it may have downloaded it).
           const f = playlistSyncFailed.get(key);
-          failedSongs.push({ title: f.title, artist: f.artist });
+          failedSongs.push({ title: f.title, artist: f.artist, duration: t.duration || 0, id: t.id || '' });
         }
       }
     }
@@ -6138,7 +6349,7 @@ async function syncPlaylistDownloads() {
     for (const [cid, meta] of Object.entries(trackMetadataIndex)) {
       if (meta && meta.title) cachedByKey.set(trackKey(meta.artist, meta.title), cid);
     }
-    const isCached = (t) => hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(trackKey(t.artist, t.title)));
+    const isCached = (t) => hasCachedAudio(cleanTrackId(t.id || '')) || hasCachedAudio(cachedByKey.get(trackKey(t.artist, t.title))) || !!songFileFor(t.artist, t.title);
     const seen = new Set();
     const missing = [];
     for (const t of tracks) {
@@ -6159,7 +6370,8 @@ async function syncPlaylistDownloads() {
       if (ok) {
         if (playlistSyncFailed.delete(trackKey(t.artist, t.title))) savePlaylistSyncFailed();
       } else {
-        playlistSyncFailed.set(trackKey(t.artist, t.title), { title: t.title, artist: t.artist || '', at: Date.now() });
+        const key = trackKey(t.artist, t.title);
+        playlistSyncFailed.set(key, { title: t.title, artist: t.artist || '', at: Date.now(), tried: matchAttempts.get(key) || [] });
         playlistSyncProgress.failed++;
         savePlaylistSyncFailed();
       }
@@ -6250,6 +6462,7 @@ function handleRemoteRoute(req, res, parsedUrl) {
   const query = parsedUrl.query || {};
 
   if (route === 'settings') return handleForkSettings(req, res);
+  if (route === 'song-match') return handleSongMatch(req, res, parsedUrl);
   if (route === 'state' && req.method === 'GET') {
     return send(200, { success: true, state: remoteState, now: Date.now() });
   }
@@ -9414,6 +9627,7 @@ async function requestHandler(req, res) {
   }
 
   if (parsedUrl.pathname === '/api/fork-settings') return handleForkSettings(req, res);
+  if (parsedUrl.pathname === '/api/song-match') return handleSongMatch(req, res, parsedUrl);
 
   if (parsedUrl.pathname === '/api/prefetch-stream' && req.method === 'POST') {
     // The window's own search results: start fetching the likeliest picks (see queueRemotePrefetch).

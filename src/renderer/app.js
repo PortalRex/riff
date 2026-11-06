@@ -10903,6 +10903,167 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // The match picker: songs are found on YouTube by artist and title, and the best-scoring video is
+  // sometimes another song (or none will download). This shows the video the song plays from, what
+  // its last lookup tried and YouTube's results, each with a preview; the picked one is kept by the
+  // server (song-matches.json) and always used for the song.
+  let songMatchModal = null;
+  let songMatchPreview = null; // { audio, resumeMain }
+
+  function stopSongMatchPreview() {
+    if (!songMatchPreview) return;
+    const { audio, resumeMain } = songMatchPreview;
+    songMatchPreview = null;
+    try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch (_) {}
+    if (songMatchModal) songMatchModal.querySelectorAll('.song-match-preview').forEach(b => { b.textContent = 'Preview'; });
+    if (resumeMain && el.nativeAudio) el.nativeAudio.play().catch(() => {});
+  }
+
+  function closeSongMatchPicker() {
+    stopSongMatchPreview();
+    if (songMatchModal) closeModal(songMatchModal);
+  }
+
+  async function openSongMatchPicker(track, search = '') {
+    if (!track || !track.title) return;
+    if (!songMatchModal) {
+      songMatchModal = document.createElement('div');
+      songMatchModal.className = 'modal-backdrop hidden';
+      songMatchModal.id = 'song-match-modal';
+      songMatchModal.innerHTML =
+        '<div class="dialog-card" style="width: min(640px, 92vw); max-height: 86vh; display: flex; flex-direction: column;">' +
+        '<div class="dialog-header"><h3>Pick the video this song plays from</h3></div>' +
+        '<div class="song-match-song" style="font-weight: 600;"></div>' +
+        '<div class="song-match-now" style="margin-top: 4px; font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);"></div>' +
+        '<form class="song-match-search" style="display: flex; gap: 8px; margin-top: 12px;">' +
+        '<input type="text" class="pill-text-input" style="flex: 1;" placeholder="Search YouTube...">' +
+        '<button type="submit" class="btn-outline-pill">Search</button></form>' +
+        '<div class="song-match-list" style="margin-top: 12px; overflow-y: auto; flex: 1; min-height: 120px;"></div>' +
+        '<div class="dialog-actions"><button type="button" class="btn-outline-pill song-match-forget" style="display: none;">Forget my pick</button>' +
+        '<button type="button" class="btn-pill-primary song-match-close">Close</button></div></div>';
+      document.body.appendChild(songMatchModal);
+      songMatchModal.addEventListener('click', (ev) => { if (ev.target === songMatchModal) closeSongMatchPicker(); });
+      songMatchModal.querySelector('.song-match-close').addEventListener('click', closeSongMatchPicker);
+      songMatchModal.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeSongMatchPicker(); });
+    }
+    const modal = songMatchModal;
+    const list = modal.querySelector('.song-match-list');
+    const input = modal.querySelector('.song-match-search input');
+    const mmss = (s) => (s > 0 ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}` : '');
+    stopSongMatchPreview();
+    modal.querySelector('.song-match-song').textContent = track.artist ? `${track.title} — ${track.artist}` : track.title;
+    modal.querySelector('.song-match-now').textContent = '';
+    list.innerHTML = '<div style="color: var(--md-sys-color-outline);">Searching YouTube...</div>';
+    // Replaced on every open, so the handlers act on this song.
+    const form = modal.querySelector('.song-match-search');
+    form.onsubmit = (ev) => { ev.preventDefault(); openSongMatchPicker(track, input.value.trim()); };
+    openModal(modal);
+
+    const params = new URLSearchParams({ title: track.title, artist: track.artist || '', duration: String(track.duration || 0), id: track.id || '', q: search });
+    let data;
+    try {
+      data = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/song-match?${params}`)).json();
+    } catch (_) {
+      data = null;
+    }
+    if (!data || !data.success) {
+      list.innerHTML = '<div style="color: var(--md-sys-color-error);">Could not search YouTube. Try again in a moment.</div>';
+      return;
+    }
+    input.value = data.search || '';
+    const tried = new Map((data.tried || []).map(t => [t.id, t.result]));
+    const current = data.current;
+    const candidates = data.candidates || [];
+    // The video it plays from now goes first, even when this search did not find it.
+    if (current && !candidates.some(c => c.id === current.id)) {
+      const t = (data.tried || []).find(x => x.id === current.id) || {};
+      candidates.unshift({ id: current.id, title: t.title || `YouTube video ${current.id}`, channel: t.channel || '', duration: t.duration || 0, thumbnail: `https://i.ytimg.com/vi/${current.id}/hqdefault.jpg` });
+    } else if (current) {
+      candidates.unshift(...candidates.splice(candidates.findIndex(c => c.id === current.id), 1));
+    }
+    const nowText = current
+      ? `Plays from: ${(candidates[0] && candidates[0].title) || current.id}${current.picked ? ' (your pick)' : ''}${current.cached ? '' : ' · not downloaded yet'}`
+      : 'Not downloaded yet: Riff picks the best-scoring result below when the song is played.';
+    modal.querySelector('.song-match-now').textContent = nowText;
+    const forget = modal.querySelector('.song-match-forget');
+    forget.style.display = current && current.picked ? '' : 'none'; // the button style overrides [hidden]
+    forget.onclick = () => pickSongMatch(track, null);
+
+    list.innerHTML = '';
+    if (!candidates.length) list.innerHTML = '<div style="color: var(--md-sys-color-outline);">No results. Try another search.</div>';
+    const TRIED_LABELS = { used: 'last lookup used this', 'would not download': 'would not download', 'not the song': 'scored as another song' };
+    for (const c of candidates) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-radius: 8px;';
+      if (current && c.id === current.id) row.style.background = 'var(--md-sys-color-surface-container-high)';
+      const notes = [c.channel, mmss(c.duration)].filter(Boolean);
+      if (current && c.id === current.id) notes.push('plays now');
+      if (TRIED_LABELS[tried.get(c.id)] && !(current && c.id === current.id && tried.get(c.id) === 'used')) notes.push(TRIED_LABELS[tried.get(c.id)]);
+      row.innerHTML =
+        `<img src="${escapeHtml(c.thumbnail)}" alt="" style="width: 64px; height: 36px; object-fit: cover; border-radius: 4px; flex: none;">` +
+        `<div style="flex: 1; min-width: 0;"><div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(c.title)}</div>` +
+        `<div style="font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(notes.join(' · '))}</div></div>` +
+        '<button type="button" class="btn-outline-pill song-match-preview" style="flex: none;">Preview</button>' +
+        '<button type="button" class="btn-pill-primary song-match-use" style="flex: none;">Use this</button>';
+      const previewBtn = row.querySelector('.song-match-preview');
+      previewBtn.addEventListener('click', () => previewSongMatch(c.id, previewBtn));
+      const useBtn = row.querySelector('.song-match-use');
+      if (current && current.picked && c.id === current.id) { useBtn.disabled = true; useBtn.textContent = 'Picked'; }
+      useBtn.addEventListener('click', () => pickSongMatch(track, c));
+      list.appendChild(row);
+    }
+  }
+
+  // Plays a candidate in the picker (the server fetches it into the cache first), pausing the player.
+  async function previewSongMatch(videoId, btn) {
+    const wasThis = songMatchPreview && songMatchPreview.videoId === videoId;
+    stopSongMatchPreview();
+    if (wasThis) return; // the button stops its own preview
+    const resumeMain = !!(el.nativeAudio && !el.nativeAudio.paused);
+    if (resumeMain) el.nativeAudio.pause();
+    const audio = new Audio();
+    audio.volume = el.nativeAudio ? el.nativeAudio.volume : 1;
+    audio.muted = !!(el.nativeAudio && el.nativeAudio.muted);
+    songMatchPreview = { audio, resumeMain, videoId };
+    btn.textContent = 'Loading...';
+    try {
+      const data = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/stream-info?id=${encodeURIComponent(videoId)}&platform=youtube&quality=low`)).json();
+      if (!songMatchPreview || songMatchPreview.audio !== audio) return; // stopped meanwhile
+      if (!data || !data.success || !data.streamUrl) throw new Error('no stream');
+      audio.src = data.streamUrl;
+      await audio.play();
+      btn.textContent = 'Stop';
+    } catch (_) {
+      if (songMatchPreview && songMatchPreview.audio === audio) {
+        stopSongMatchPreview();
+        btn.textContent = 'Would not load';
+      }
+    }
+  }
+
+  // Saves the pick (null forgets it) and drops the old match's stream from loaded songs.
+  async function pickSongMatch(track, video) {
+    stopSongMatchPreview();
+    let ok = false;
+    try {
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/song-match`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: track.title, artist: track.artist || '', id: track.id || '', duration: track.duration || 0, thumbnail: track.thumbnail || '',
+          videoId: video ? video.id : null, video
+        })
+      });
+      ok = res.ok;
+    } catch (_) {}
+    if (!ok) { showToast('Could not save the pick', 'error'); return; }
+    const sameSong = (t) => t && (t.title || '').toLowerCase() === track.title.toLowerCase() && (t.artist || '').toLowerCase() === (track.artist || '').toLowerCase();
+    for (const t of [state.currentTrack, ...(state.queue || [])]) {
+      if (sameSong(t)) delete t._preloadedStreamUrl;
+    }
+    closeSongMatchPicker();
+    showToast(video ? `“${track.title}” now plays from the picked video. Downloading it now.` : `Forgot the pick for “${track.title}”. Riff searches for it again.`, 'success');
+  }
+
   function openTrackContextMenu(e, track, options = {}) {
     if (ctxMenuEl && ctxMenuEl.classList.contains('open')) {
       closeTrackContextMenu();
@@ -11003,7 +11164,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             openModal(el.renameTrackModal);
           }
         }
-      }
+      },
+      ...(track.platform !== 'local' && track.platform !== 'soundcloud' ? [{
+        id: 'match',
+        label: 'Wrong song? Pick the video',
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><polyline points="8 11 10 13 14 9"/></svg>',
+        action: () => openSongMatchPicker(track)
+      }] : [])
     ];
 
     if (state.currentView === 'playlist-detail' && state.currentPlaylist) {
@@ -17403,7 +17570,18 @@ function bindCoverHoldZoom(wrapEl) {
     list.innerHTML = '';
     for (const f of failedSongs) {
       const li = document.createElement('li');
-      li.textContent = f.artist ? `${f.title} — ${f.artist}` : f.title;
+      li.style.cssText = 'margin: 2px 0;';
+      li.textContent = f.artist ? `${f.title} — ${f.artist} ` : `${f.title} `;
+      // Shows the videos the sync tried and lets another one be picked.
+      const check = document.createElement('a');
+      check.href = '#';
+      check.textContent = 'Check the match';
+      check.style.cssText = 'color: var(--md-sys-color-primary);';
+      check.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        openSongMatchPicker({ title: f.title, artist: f.artist || '', duration: f.duration || 0, id: f.id || '' });
+      });
+      li.appendChild(check);
       list.appendChild(li);
     }
   }
