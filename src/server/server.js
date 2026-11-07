@@ -4210,7 +4210,7 @@ async function fetchArtistInfo(artistName, hintTrack = '') {
         // Artists on none of the catalogs (Godspeed You! Black Emperor): YouTube uploads that
         // name the artist, without reviews and reactions.
         const notMusic = /\b(?:reacts?|reaction|reviews?|tutorial|lesson|interview|explained)\b/i;
-        const directResults = ((await directYoutubeSearch(cleanName, true).catch(() => [])) || [])
+        const directResults = ((await directYoutubeSearch(cleanName, false).catch(() => [])) || [])
           .filter(t => searchResultMatchesQuery(t, cleanName) && !notMusic.test(t.title || ''));
         if (directResults.length > 0) {
           tracks = directResults;
