@@ -13818,6 +13818,85 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
     switchView('discover');
   }
 
+  // Duplicate check for adding to a playlist: the same song is either the same track (id) or one
+  // with the same title and artist from another source (YouTube vs SoundCloud, or an import).
+  function duplicateNameKey(track) {
+    const title = String((track && track.title) || '').trim().toLowerCase();
+    if (!title) return '';
+    return `${title}|${String(track.artist || '').trim().toLowerCase()}`;
+  }
+
+  function playlistDuplicates(pl, tracks) {
+    const existing = Array.isArray(pl && pl.tracks) ? pl.tracks : [];
+    const ids = new Set(existing.map(getTrackCanonicalId));
+    const names = new Set(existing.map(duplicateNameKey).filter(Boolean));
+    return tracks.filter(t => ids.has(getTrackCanonicalId(t)) || names.has(duplicateNameKey(t)));
+  }
+
+  // Asks what to do when some of the songs are already in the playlist. Resolves 'all' (add them
+  // anyway), 'new' (only the songs not in it yet) or null (add nothing).
+  let resolveDuplicateChoice = null;
+  function askDuplicateChoice(pl, tracks, duplicates) {
+    const modal = document.getElementById('duplicate-track-modal');
+    if (!modal) return Promise.resolve('all');
+    if (resolveDuplicateChoice) resolveDuplicateChoice(null);
+    const title = document.getElementById('duplicate-track-title');
+    const msg = document.getElementById('duplicate-track-msg');
+    const btnSecondary = document.getElementById('btn-duplicate-track-secondary');
+    const btnPrimary = document.getElementById('btn-duplicate-track-primary');
+    const someNew = duplicates.length < tracks.length;
+    if (!someNew) {
+      title.textContent = 'Already added';
+      msg.textContent = tracks.length === 1
+        ? `This song is already in "${pl.name}".`
+        : `These songs are already in "${pl.name}".`;
+      btnSecondary.textContent = "Don't add";
+      btnPrimary.textContent = 'Add anyway';
+    } else {
+      title.textContent = 'Some already added';
+      msg.textContent = `${duplicates.length} of these ${tracks.length} songs ${duplicates.length === 1 ? 'is' : 'are'} already in "${pl.name}".`;
+      btnSecondary.textContent = 'Add all';
+      btnPrimary.textContent = 'Add new ones';
+    }
+    return new Promise((resolve) => {
+      const finish = (choice) => {
+        resolveDuplicateChoice = null;
+        btnSecondary.onclick = null;
+        btnPrimary.onclick = null;
+        modal.onclick = null;
+        closeModal(modal);
+        resolve(choice);
+      };
+      resolveDuplicateChoice = finish;
+      btnSecondary.onclick = () => finish(someNew ? 'all' : null);
+      btnPrimary.onclick = () => finish(someNew ? 'new' : 'all');
+      modal.onclick = (e) => { if (e.target === modal) finish(null); };
+      openModal(modal);
+    });
+  }
+
+  async function addTracksToPlaylistChecked(pl, tracks, fromSelection) {
+    if (!Array.isArray(pl.tracks)) pl.tracks = [];
+    let toAdd = tracks;
+    const duplicates = playlistDuplicates(pl, tracks);
+    if (duplicates.length > 0) {
+      const choice = await askDuplicateChoice(pl, tracks, duplicates);
+      if (!choice) return;
+      if (choice === 'new') toAdd = tracks.filter(t => !duplicates.includes(t));
+    }
+    if (!state.playlists.includes(pl)) return; // deleted while the question was open
+    pl.tracks.push(...toAdd.map(stampAddedAt));
+    localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
+    renderPlaylistsList();
+    if (state.currentView === 'playlist-detail' && state.currentPlaylistId === pl.id) {
+      openPlaylistDetail(pl.id);
+    }
+    showToast(fromSelection
+      ? `Added ${toAdd.length} ${toAdd.length === 1 ? 'track' : 'tracks'} to "${pl.name}"`
+      : `Added to "${pl.name}"`, 'success');
+    if (fromSelection) clearTrackSelection();
+  }
+
   let trackToAddToPlaylist = null;
   function openAddToPlaylistModal(track) {
     trackToAddToPlaylist = track;
@@ -13893,7 +13972,8 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
         item.className = 'playlist-pick-item';
         item.style.animationDelay = `${idx * 25}ms`;
 
-        const isAlreadyAdded = false;
+        const pickTracks = Array.isArray(track) ? track : (track ? [track] : []);
+        const isAlreadyAdded = pickTracks.length > 0 && playlistDuplicates(pl, pickTracks).length === pickTracks.length;
         if (isAlreadyAdded) item.classList.add('already-added');
 
         const thumbEl = document.createElement('div');
@@ -13943,30 +14023,8 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
         item.appendChild(actionEl);
 
         item.addEventListener('click', () => {
-          if (Array.isArray(track)) {
-            let addedCount = 0;
-            if (!Array.isArray(pl.tracks)) pl.tracks = [];
-            track.forEach(t => {
-              pl.tracks.push(stampAddedAt(t));
-              addedCount++;
-            });
-            localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
-            renderPlaylistsList();
-            if (state.currentView === 'playlist-detail' && state.currentPlaylistId === pl.id) {
-              openPlaylistDetail(pl.id);
-            }
-            showToast(`Added ${addedCount} tracks to "${pl.name}"`, 'success');
-            clearTrackSelection();
-          } else if (track) {
-            pl.tracks.push(stampAddedAt(track));
-            localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
-            renderPlaylistsList();
-            if (state.currentView === 'playlist-detail' && state.currentPlaylistId === pl.id) {
-              openPlaylistDetail(pl.id);
-            }
-            showToast(`Added to "${pl.name}"`, 'success');
-          }
           if (el.addToPlaylistModal) closeModal(el.addToPlaylistModal);
+          if (pickTracks.length > 0) addTracksToPlaylistChecked(pl, pickTracks, Array.isArray(track));
         });
 
         el.playlistPickList.appendChild(item);
@@ -18926,6 +18984,11 @@ function bindCoverHoldZoom(wrapEl) {
         const playlist = state.playlists.find(p => p.id === command.playlistId);
         if (!track || !playlist) break;
         if (!Array.isArray(playlist.tracks)) playlist.tracks = [];
+        // From Flow there is nobody at the window to ask, so a song already in it is not added again.
+        if (playlistDuplicates(playlist, [track]).length > 0 && !command.allowDuplicate) {
+          showToast(`Already in "${playlist.name}"`);
+          break;
+        }
         playlist.tracks.push(stampAddedAt(track));
         localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
         renderPlaylistsList();
