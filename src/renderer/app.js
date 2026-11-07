@@ -17740,7 +17740,13 @@ function bindCoverHoldZoom(wrapEl) {
         btn.innerHTML = '<span class="thumb"></span>';
         btn.addEventListener('click', async () => {
           const next = !btn.classList.contains('active');
-          if (await saveForkSetting(s.key, next)) btn.classList.toggle('active', next);
+          if (await saveForkSetting(s.key, next)) {
+            btn.classList.toggle('active', next);
+            if (s.key === 'spotifySync') {
+              spotifySyncOn = next;
+              if (next) syncSpotifyLibrary(); // the first sync right away, not in 30 minutes
+            }
+          }
         });
         top.appendChild(btn);
         if (s.key === 'keepAlbumsDownloaded') { // the progress of both "keep downloaded" switches, under the second
@@ -17785,12 +17791,14 @@ function bindCoverHoldZoom(wrapEl) {
         item.style.alignItems = 'stretch';
         item.appendChild(slider);
       }
-      if (s.key === 'volumeScrollStep') {
-        // An interface setting: it goes at the end of Settings > Interface, not under Storage.
-        const interfaceGroup = document.getElementById('setting-sidebar-home-customizer')?.parentElement;
-        document.getElementById('fork-volume-step-item')?.remove();
-        item.id = 'fork-volume-step-item';
-        (interfaceGroup || group).appendChild(item);
+      if (s.key === 'spotifySync') spotifySyncOn = !!s.value;
+      // Settings that belong elsewhere than Storage: placed right after the given row.
+      const placeAfter = { volumeScrollStep: 'setting-sidebar-home-customizer', spotifySync: 'card-spotify-import' }[s.key];
+      const anchor = placeAfter && document.getElementById(placeAfter);
+      if (anchor) {
+        document.getElementById(`fork-setting-${s.key}`)?.remove();
+        item.id = `fork-setting-${s.key}`;
+        anchor.after(item);
         continue;
       }
       group.appendChild(item);
@@ -20927,7 +20935,6 @@ function bindCoverHoldZoom(wrapEl) {
   function hydrateMissingPlaylistCovers() {}
 
   async function matchSpotifyTracks(rawTracks, playlistName = 'Playlist', onProgress, options = {}) {
-    if (el && el.linkImportModal) closeModal(el.linkImportModal);
     if (typeof playlistName === 'function') {
       const origProg = playlistName;
       if (typeof onProgress === 'object' && onProgress !== null) {
@@ -20941,18 +20948,20 @@ function bindCoverHoldZoom(wrapEl) {
     }
     if (!options || typeof options !== 'object') options = {};
     if (!playlistName || typeof playlistName !== 'string') playlistName = options.playlistName || options.name || 'Playlist';
+    // options.silent: background sync, so no dialog is closed and no "Importing..." toast shows.
+    if (!options.silent && el && el.linkImportModal) closeModal(el.linkImportModal);
 
     const list = Array.isArray(rawTracks) ? rawTracks : [];
     const total = list.length;
 
-    const container = document.getElementById('toast-container');
+    const container = options.silent ? null : document.getElementById('toast-container');
     let toast = null;
     let textSpan = null;
     let iconSpan = null;
     const spinnerSvg = '<svg class="g-spinner" style="width:18px;height:18px;" viewBox="0 0 48 48"><circle cx="24" cy="24" r="20"/></svg>';
     const checkmarkSvg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><polyline points="5 12.5 10 17.5 19 7.5"/></svg>';
 
-    if (activeImportToast && activeImportToast.parentNode === container) {
+    if (container && activeImportToast && activeImportToast.parentNode === container) {
       toast = activeImportToast;
       textSpan = toast.querySelector('.toast-text');
       iconSpan = toast.querySelector('.toast-icon');
@@ -21477,6 +21486,174 @@ function bindCoverHoldZoom(wrapEl) {
     if (spotifyModal) closeModal(spotifyModal);
   }
 
+  // ---- Spotify import and sync -------------------------------------------------------------
+  // A Riff song is the Spotify song when it has its Spotify id, or (export-file imports have no
+  // ids) the same title and artist. riff_spotify_sync keeps the Spotify ids of the last import or
+  // sync per list, which tells "removed on Spotify" (remove it here) apart from "removed in
+  // Riff" (do not add it back), and "added in Riff" from both.
+  const SPOTIFY_SYNC_KEY = 'riff_spotify_sync';
+  const SPOTIFY_SYNC_EVERY_MS = 30 * 60 * 1000;
+  let spotifySyncOn = false;
+  let spotifySyncBusy = false;
+
+  function getSpotifySyncSeen() {
+    const seen = safeJson(SPOTIFY_SYNC_KEY, null);
+    return {
+      likes: seen && Array.isArray(seen.likes) ? seen.likes : null,
+      playlists: (seen && seen.playlists && typeof seen.playlists === 'object') ? seen.playlists : {}
+    };
+  }
+  function saveSpotifySyncSeen(seen) {
+    try { localStorage.setItem(SPOTIFY_SYNC_KEY, JSON.stringify(seen)); } catch (_) {}
+  }
+
+  // Brings a Riff list (liked songs or a playlist's tracks, changed in place) up to the Spotify
+  // list. prevIds = the Spotify ids seen last time, or null for a plain import (add what is
+  // missing, remove nothing).
+  async function applySpotifyList(list, spTracks, prevIds) {
+    const byId = new Map();
+    const byName = new Map();
+    for (const t of list) {
+      if (t.spotifyId) byId.set(t.spotifyId, t);
+      const key = duplicateNameKey(t);
+      if (key && !byName.has(key)) byName.set(key, t);
+    }
+    const prev = prevIds ? new Set(prevIds) : null;
+    const missing = [];
+    const missingKeys = new Set();
+    for (const sp of spTracks) {
+      const have = (sp.id && byId.get(sp.id)) || byName.get(duplicateNameKey(sp));
+      if (have) {
+        if (sp.id && !have.spotifyId) have.spotifyId = sp.id; // so a later removal on Spotify finds it
+        continue;
+      }
+      if (prev && sp.id && prev.has(sp.id)) continue; // removed in Riff since the last sync
+      const key = sp.id || duplicateNameKey(sp);
+      if (missingKeys.has(key)) continue;
+      missingKeys.add(key);
+      missing.push(sp);
+    }
+    const added = missing.length > 0 ? await matchSpotifyTracks(missing, { silent: true }) : [];
+    list.push(...added.map(stampAddedAt));
+    let removed = 0;
+    if (prev) {
+      const now = new Set(spTracks.map(sp => sp.id).filter(Boolean));
+      for (let i = list.length - 1; i >= 0; i--) {
+        const id = list[i].spotifyId;
+        if (id && prev.has(id) && !now.has(id)) { list.splice(i, 1); removed++; }
+      }
+    }
+    return { added: added.length, removed };
+  }
+
+  // The Riff playlist for a Spotify playlist: the one linked to it, else one with the same name
+  // (imported before links existed), else a new one. prevPlaylists (sync only): a playlist that
+  // was synced before and has no Riff copy now was deleted in Riff, so it is not made again.
+  function findOrMakeSpotifyPlaylist(spPl, prevPlaylists) {
+    const norm = (n) => String(n || '').trim().toLowerCase();
+    let pl = spPl.id ? state.playlists.find(p => p.spotifyId === spPl.id) : null;
+    if (!pl) pl = state.playlists.find(p => !p.spotifyId && norm(p.name) === norm(spPl.name));
+    if (!pl) {
+      if (prevPlaylists && spPl.id && prevPlaylists[spPl.id]) return null;
+      pl = { id: 'pl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name: String(spPl.name || 'Spotify playlist').trim(), tracks: [] };
+      state.playlists.push(pl);
+    }
+    if (spPl.id) pl.spotifyId = spPl.id;
+    if (!Array.isArray(pl.tracks)) pl.tracks = [];
+    return pl;
+  }
+
+  function saveFavoritesAfterSync() {
+    localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites));
+    updateFavoritesBadge();
+    updateFavoriteIcon();
+    if (state.currentView === 'favorites') renderFavoritesView();
+    hydrateMissingPlaylistCovers(state.favorites);
+  }
+  function savePlaylistsAfterSync() {
+    localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists));
+    renderPlaylistsList();
+    if (state.currentView === 'playlist-detail' && state.currentPlaylistId) openPlaylistDetail(state.currentPlaylistId);
+  }
+
+  // Spotify -> Riff: songs liked or added there are added here, songs removed there are removed
+  // here (only ones that came from Spotify), and a renamed playlist is renamed. Playlists deleted
+  // on Spotify stay in Riff.
+  async function syncSpotifyLibrary() {
+    if (spotifySyncBusy || !spotifySyncOn) return;
+    spotifySyncBusy = true;
+    try {
+      const status = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/spotify-status`, { headers: spotifyHeaders })).json();
+      if (!status.connected) return;
+      const data = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/spotify-library?likes=1&playlists=1`, { headers: spotifyHeaders })).json();
+      if (!data.success) return;
+      const seen = getSpotifySyncSeen();
+      let added = 0;
+      let removed = 0;
+
+      const likes = Array.isArray(data.likes) ? data.likes : [];
+      const likeResult = await applySpotifyList(state.favorites, likes, seen.likes);
+      added += likeResult.added;
+      removed += likeResult.removed;
+      if (likeResult.added || likeResult.removed) saveFavoritesAfterSync();
+      seen.likes = likes.map(t => t.id).filter(Boolean);
+
+      let playlistsChanged = false;
+      for (const spPl of (Array.isArray(data.playlists) ? data.playlists : [])) {
+        if (!spPl.id) continue;
+        const prevIds = seen.playlists[spPl.id] || null;
+        const pl = findOrMakeSpotifyPlaylist(spPl, seen.playlists);
+        if (!pl) continue;
+        if (prevIds && spPl.name && pl.name !== spPl.name.trim()) { pl.name = spPl.name.trim(); playlistsChanged = true; }
+        const result = await applySpotifyList(pl.tracks, spPl.tracks || [], prevIds);
+        if (result.added || result.removed || !prevIds) playlistsChanged = true;
+        added += result.added;
+        removed += result.removed;
+        seen.playlists[spPl.id] = (spPl.tracks || []).map(t => t.id).filter(Boolean);
+      }
+      if (playlistsChanged) savePlaylistsAfterSync();
+      saveSpotifySyncSeen(seen);
+      if (added || removed) {
+        const parts = [];
+        if (added) parts.push(`${added} added`);
+        if (removed) parts.push(`${removed} removed`);
+        showToast(`Synced with Spotify: ${parts.join(', ')}`, 'success');
+      }
+    } catch (_) {
+      // Offline or Spotify refused: the next sync tries again.
+    } finally {
+      spotifySyncBusy = false;
+    }
+  }
+  setTimeout(syncSpotifyLibrary, 60 * 1000);
+  setInterval(syncSpotifyLibrary, SPOTIFY_SYNC_EVERY_MS);
+
+  // One-time cleanup: importing Liked songs again used to add every song a second time (the
+  // first import from export files had no Spotify ids). Keeps the older copy, which gets the
+  // Spotify id of the newer one.
+  (function dedupeLikedSongsOnce() {
+    if (localStorage.getItem('riff_fav_dedupe_v1')) return;
+    const keep = new Map();
+    const result = [];
+    let dropped = 0;
+    for (const t of state.favorites || []) {
+      const key = duplicateNameKey(t);
+      const first = key && keep.get(key);
+      if (first) {
+        if (!first.spotifyId && t.spotifyId) { first.spotifyId = t.spotifyId; first.spotifyUrl = t.spotifyUrl || first.spotifyUrl; }
+        dropped++;
+        continue;
+      }
+      if (key) keep.set(key, t);
+      result.push(t);
+    }
+    if (dropped > 0) {
+      state.favorites = result;
+      saveFavoritesAfterSync();
+    }
+    localStorage.setItem('riff_fav_dedupe_v1', String(dropped));
+  })();
+
   async function runSpotifyImport({ likes = [], playlists = [], skippedPlaylists = [] }) {
     const likesToImport = likes || [];
     const playlistsToImport = playlists || [];
@@ -21500,34 +21677,33 @@ function bindCoverHoldZoom(wrapEl) {
     let globalCompleted = 0;
     let totalFoundCount = 0;
     try {
+      // Importing again only adds what is missing (same Spotify id, or same title and artist),
+      // and a playlist imported before gets the new songs instead of a second copy.
+      const seen = getSpotifySyncSeen();
+      let added = 0;
       if (likesToImport.length > 0) {
-        const foundLikes = await matchSpotifyTracks(likesToImport, 'Liked Songs');
         globalCompleted += likesToImport.length;
-        totalFoundCount += foundLikes.length;
-        let addedFav = false;
-        for (const track of foundLikes) {
-          if (!state.favorites.some(f => isSameTrack(f, track))) {
-            state.favorites.push(stampAddedAt(track));
-            addedFav = true;
-          }
-        }
-        if (addedFav) {
-          localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites));
-          updateFavoritesBadge();
-          updateFavoriteIcon();
-          if (state.currentView === 'favorites') renderFavoritesView();
-          hydrateMissingPlaylistCovers(state.favorites);
-        }
+        added += (await applySpotifyList(state.favorites, likesToImport, null)).added;
+        totalFoundCount += likesToImport.length;
+        saveFavoritesAfterSync();
+        if (likesToImport.some(t => t.id)) seen.likes = likesToImport.map(t => t.id).filter(Boolean);
       }
 
       if (playlistsToImport.length > 0) {
-        for (const pl of playlistsToImport) {
-          const found = await matchSpotifyTracks(pl.tracks || [], pl.name || 'Playlist');
-          globalCompleted += (pl.tracks || []).length;
-          totalFoundCount += found.length;
-          createPlaylist(pl.name, found, pl.cover || '');
+        for (const spPl of playlistsToImport) {
+          globalCompleted += (spPl.tracks || []).length;
+          totalFoundCount += (spPl.tracks || []).length;
+          const pl = findOrMakeSpotifyPlaylist(spPl, null);
+          if (!pl) continue;
+          if (!pl.cover && spPl.cover) pl.cover = spPl.cover;
+          added += (await applySpotifyList(pl.tracks, spPl.tracks || [], null)).added;
+          if (spPl.id) seen.playlists[spPl.id] = (spPl.tracks || []).map(t => t.id).filter(Boolean);
         }
+        savePlaylistsAfterSync();
       }
+      saveSpotifySyncSeen(seen);
+      dismissImportSpinnerToast();
+      showToast(added > 0 ? `Imported ${added} new ${added === 1 ? 'song' : 'songs'}` : 'Nothing new to import: everything is already in Riff', 'success');
     } catch (err) {
       dismissImportSpinnerToast();
       showToast(err.message || 'Failed to import tracks', 'error');

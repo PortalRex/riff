@@ -491,6 +491,7 @@ const FORK_SETTINGS = {
   raceLookups: { default: true, label: 'Two lookups per song', description: 'Fetch each new song signed in and anonymous at once and keep the faster one (fewer slow songs, twice the requests)' },
   signedInSearch: { default: true, label: 'Signed-in YouTube Music search', description: 'Send your YouTube sign-in with searches (YouTube Music refuses fewer of them)' },
   cacheLimitGB: { default: 10, label: 'Cache limit (GB)', description: 'Songs played longest ago are removed above this' },
+  spotifySync: { default: false, label: 'Keep in sync with Spotify', description: 'Every 30 minutes, add songs you liked or added to playlists on Spotify, and remove the ones you removed there. Songs added in Riff are never removed' },
   volumeScrollStep: { default: 5, label: 'Volume scroll step (%)', description: 'How much one notch of the mouse wheel on the volume bar changes the volume' },
 };
 let forkSettings = {};
@@ -2904,6 +2905,12 @@ function searchWords(text) {
   return String(text || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9Ѐ-ӿ]+/g, ' ').trim().split(' ').filter(Boolean);
 }
+function sameArtistName(artist, target) {
+  const want = searchWords(target).join(' ');
+  if (!want) return false;
+  // "Artist", or one of "Artist & Other", "Artist feat. Other"
+  return String(artist || '').split(/[,&\/]|\bfeat\.?|\bft\.?|\s+x\s+/i).some(part => searchWords(part).join(' ') === want);
+}
 function searchResultMatchesQuery(track, query) {
   const words = searchWords(query).filter(w => w.length >= 3);
   if (words.length === 0) return true;
@@ -4170,8 +4177,10 @@ async function fetchArtistInfo(artistName, hintTrack = '') {
         const itunesSearchSongsUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(cleanName)}&entity=song&limit=30`;
         const itunesSongsData = await fetchItunesJson(itunesSearchSongsUrl).catch(() => null);
         if (itunesSongsData && Array.isArray(itunesSongsData.results)) {
+          // Only songs by this artist: a song search also returns songs named after it
+          // ("Godspeed You Black Emperor" by Makenpink) and songs with the same title.
           const itTracks = itunesSongsData.results
-            .filter(item => item && item.wrapperType === 'track')
+            .filter(item => item && item.wrapperType === 'track' && sameArtistName(item.artistName, cleanName))
             .map(item => {
               const dur = Math.round((item.trackTimeMillis || 0) / 1000);
               const cover = item.artworkUrl100 ? item.artworkUrl100.replace('100x100', '600x600') : '';
@@ -4198,8 +4207,12 @@ async function fetchArtistInfo(artistName, hintTrack = '') {
 
     if (tracks.length < 4) {
       try {
-        const directResults = await directYoutubeSearch(`${cleanName} official audio`, true).catch(() => []);
-        if (directResults && directResults.length > 0) {
+        // Artists on none of the catalogs (Godspeed You! Black Emperor): YouTube uploads that
+        // name the artist, without reviews and reactions.
+        const notMusic = /\b(?:reacts?|reaction|reviews?|tutorial|lesson|interview|explained)\b/i;
+        const directResults = ((await directYoutubeSearch(cleanName, true).catch(() => [])) || [])
+          .filter(t => searchResultMatchesQuery(t, cleanName) && !notMusic.test(t.title || ''));
+        if (directResults.length > 0) {
           tracks = directResults;
         }
       } catch (_) {}
@@ -8456,7 +8469,7 @@ async function handleSpotifyLibrary(req, res, query) {
           }
           trackNext = nextData.next || null;
         }
-        playlists.push({ name: pl.name, tracks: plTracks });
+        playlists.push({ id: pl.id, name: pl.name, tracks: plTracks }); // id: links it to its Riff copy for sync
       }
     }
 
