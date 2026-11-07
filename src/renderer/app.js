@@ -19924,7 +19924,7 @@ function bindCoverHoldZoom(wrapEl) {
     const originalBtnHtml = btn ? btn.innerHTML : 'Check for updates';
     let manualUpdateCheck = false;
     let checkTimeoutId = null;
-    let fallbackReleaseUrl = 'https://github.com/rootscripts/riff/releases/latest';
+    let fallbackReleaseUrl = 'https://github.com/PortalRex/riff/releases/latest';
     let canNativeInstall = false;
 
     let latestUpdateInfo = null;
@@ -20046,13 +20046,13 @@ function bindCoverHoldZoom(wrapEl) {
           showToast('Could not check for updates', 'error');
           return;
         }
-        const res = await fetch('https://api.github.com/repos/rootscripts/riff/releases/latest', {
+        const res = await fetch('https://api.github.com/repos/PortalRex/riff/releases/latest', {
           headers: { 'User-Agent': 'Riff-Player' }
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const json = await res.json();
         const latestVersion = (json.tag_name || '').replace(/^v/i, '');
-        fallbackReleaseUrl = json.html_url || 'https://github.com/rootscripts/riff/releases/latest';
+        fallbackReleaseUrl = json.html_url || 'https://github.com/PortalRex/riff/releases/latest';
         if (isNewerVersion(latestVersion, currentAppVersion)) {
           latestUpdateInfo = {
             version: latestVersion,
@@ -20104,33 +20104,32 @@ function bindCoverHoldZoom(wrapEl) {
       });
     }
 
-    if (api && api.onUpdateAvailable) {
-      api.onUpdateAvailable(async (info) => {
-        restoreButton();
-        latestUpdateInfo = { ...(info || {}) };
-        canNativeInstall = !!info?.canInstall;
+    const handleUpdateAvailable = async (info) => {
+      restoreButton();
+      latestUpdateInfo = { ...(info || {}) };
+      canNativeInstall = !!info?.canInstall;
 
-        const hasImg = latestUpdateInfo.releaseNotes && /<img/i.test(latestUpdateInfo.releaseNotes);
-        const hasPublishedAt = !!latestUpdateInfo.publishedAt;
+      const hasImg = latestUpdateInfo.releaseNotes && /<img/i.test(latestUpdateInfo.releaseNotes);
+      const hasPublishedAt = !!latestUpdateInfo.publishedAt;
 
-        if (!hasImg || !hasPublishedAt) {
-          try {
-            const res = await fetch('https://api.github.com/repos/rootscripts/riff/releases/latest', {
-              headers: { 'User-Agent': 'Riff-Player' }
-            });
-            if (res.ok) {
-              const gh = await res.json();
-              if (gh.body) latestUpdateInfo.releaseNotes = gh.body;
-              if (gh.published_at) latestUpdateInfo.publishedAt = gh.published_at;
-              if (gh.html_url) latestUpdateInfo.htmlUrl = gh.html_url;
-              if (gh.tag_name && !latestUpdateInfo.version) latestUpdateInfo.version = gh.tag_name;
-            }
-          } catch (_) {}
-        }
+      if (!hasImg || !hasPublishedAt) {
+        try {
+          const res = await fetch('https://api.github.com/repos/PortalRex/riff/releases/latest', {
+            headers: { 'User-Agent': 'Riff-Player' }
+          });
+          if (res.ok) {
+            const gh = await res.json();
+            if (gh.body) latestUpdateInfo.releaseNotes = gh.body;
+            if (gh.published_at) latestUpdateInfo.publishedAt = gh.published_at;
+            if (gh.html_url) latestUpdateInfo.htmlUrl = gh.html_url;
+            if (gh.tag_name && !latestUpdateInfo.version) latestUpdateInfo.version = gh.tag_name;
+          }
+        } catch (_) {}
+      }
 
-        populateOtaUpdateSheet(latestUpdateInfo);
-      });
-    }
+      populateOtaUpdateSheet(latestUpdateInfo);
+    };
+    if (api && api.onUpdateAvailable) api.onUpdateAvailable(handleUpdateAvailable);
 
     const onDownloaded = (info) => {
       isUpdateDownloaded = true;
@@ -20198,6 +20197,15 @@ function bindCoverHoldZoom(wrapEl) {
         if (fill) fill.style.width = (d?.percent || 0) + '%';
         if (label) label.textContent = (d?.percent || 0) + '%';
       });
+    }
+
+    // The startup check can finish before these listeners exist, so ask for what it found.
+    if (api && api.getPendingUpdate) {
+      api.getPendingUpdate().then(async (pending) => {
+        if (!pending || !pending.available) return;
+        await handleUpdateAvailable(pending.available);
+        if (pending.downloaded) onDownloaded(pending.downloaded);
+      }).catch(() => {});
     }
 
     const btnUpdateNow = document.getElementById('btn-update-now');

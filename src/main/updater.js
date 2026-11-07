@@ -40,6 +40,10 @@ function initUpdater(getWindow) {
   let manualCheck = false;
   let installNow = false;
   let current = null;
+  // The last update found and whether it is downloaded. The first check runs before the window
+  // listens, so the window asks for these once it is ready (update-pending) instead of missing them.
+  let lastAvailable = null;
+  let lastDownloaded = null;
 
   try { ipcMain.removeHandler('get-app-version'); } catch (_) {}
   ipcMain.handle('get-app-version', () => app.getVersion());
@@ -67,14 +71,15 @@ function initUpdater(getWindow) {
         const ignored = readIgnored(ignoreFile) === latestVer;
         if (ignored && !manualCheck) return;
         manualCheck = false;
-        send('update-available', {
+        lastAvailable = {
           version: latestVer,
           releaseNotes: json.body || '',
           publishedAt: json.published_at || '',
           htmlUrl: json.html_url || '',
           canInstall: false,
           url: json.html_url || `${releasesUrl}/tag/v${latestVer}`
-        });
+        };
+        send('update-available', lastAvailable);
       } else {
         if (manualCheck) {
           send('update-not-available', { version: currentVersion });
@@ -130,14 +135,15 @@ function initUpdater(getWindow) {
         current.publishedAt = publishedAt;
         current.htmlUrl = htmlUrl;
 
-        send('update-available', {
+        lastAvailable = {
           version: info.version,
           canInstall,
           url: `${releasesUrl}/tag/v${info.version}`,
           releaseNotes,
           publishedAt,
           htmlUrl
-        });
+        };
+        send('update-available', lastAvailable);
 
         autoUpdater.downloadUpdate().catch(() => {});
       });
@@ -155,13 +161,14 @@ function initUpdater(getWindow) {
           autoUpdater.quitAndInstall();
         } else {
           send('update-ready', { version: current && current.version });
-          send('update-downloaded', {
+          lastDownloaded = {
             version: current && current.version,
             releaseNotes: current && (current.releaseNotes || current.body || ''),
             publishedAt: current && (current.publishedAt || current.published_at || ''),
             htmlUrl: current && (current.htmlUrl || current.html_url || ''),
             canInstall: true
-          });
+          };
+          send('update-downloaded', lastDownloaded);
         }
       });
 
@@ -184,10 +191,20 @@ function initUpdater(getWindow) {
 
   try { ipcMain.removeHandler('update-check'); } catch (_) {}
   ipcMain.handle('update-check', () => {
+    // An update already found (and maybe downloaded) is shown again at once; checking again
+    // could report nothing while its download is still running.
+    if (lastAvailable) {
+      send('update-available', lastAvailable);
+      if (lastDownloaded) send('update-downloaded', lastDownloaded);
+      return { ok: true };
+    }
     manualCheck = true;
     check();
     return { ok: true };
   });
+
+  try { ipcMain.removeHandler('update-pending'); } catch (_) {}
+  ipcMain.handle('update-pending', () => ({ available: lastAvailable, downloaded: lastDownloaded }));
 
   const doInstallNow = () => {
     installNow = true;
