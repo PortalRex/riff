@@ -25869,6 +25869,52 @@ function bindCoverHoldZoom(wrapEl) {
 
   function applyCoverTintToCard() {}
 
+  // "Remove from home": right-click a card on the home page to hide it there. The keys stay in
+  // riff_home_hidden until restored from Settings > Interface (Restore removed).
+  const HOME_HIDDEN_KEY = 'riff_home_hidden';
+  function getHomeHidden() {
+    const list = safeJson(HOME_HIDDEN_KEY, []);
+    return new Set(Array.isArray(list) ? list : []);
+  }
+  function homeTrackKey(track) {
+    return 'track:' + ((typeof getTrackCanonicalId === 'function' ? getTrackCanonicalId(track) : '') || `${track.artist || ''}::${track.title || ''}`);
+  }
+  function updateHomeRestoreButton() {
+    const btn = document.getElementById('btn-restore-home-hidden');
+    if (!btn) return;
+    const count = getHomeHidden().size;
+    btn.style.display = count === 0 ? 'none' : ''; // the pill's own display would beat [hidden]
+    btn.textContent = `Restore removed (${count})`;
+  }
+  function bindRemoveFromHome(card, key, label, rerender) {
+    card.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showCtxMenuItems(e, [{
+        label: 'Remove from home',
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+        action: () => {
+          const hidden = getHomeHidden();
+          hidden.add(key);
+          localStorage.setItem(HOME_HIDDEN_KEY, JSON.stringify([...hidden]));
+          rerender();
+          updateHomeRestoreButton();
+          showToast(`Removed "${label}" from home`);
+        }
+      }]);
+    });
+  }
+  const btnRestoreHomeHidden = document.getElementById('btn-restore-home-hidden');
+  if (btnRestoreHomeHidden) {
+    btnRestoreHomeHidden.addEventListener('click', () => {
+      localStorage.removeItem(HOME_HIDDEN_KEY);
+      updateHomeRestoreButton();
+      renderSpotifyHome();
+      showToast('Removed home items are back');
+    });
+  }
+  updateHomeRestoreButton();
+
   function renderQuickAccess() {
     const sec = document.getElementById('sp-quick-sec');
     const container = document.getElementById('sp-quick');
@@ -25879,6 +25925,7 @@ function bindCoverHoldZoom(wrapEl) {
     }
     sec.hidden = false;
     container.innerHTML = '';
+    const hidden = getHomeHidden();
 
     const favCount = (state.favorites || []).length;
     const likedTile = document.createElement('div');
@@ -25897,7 +25944,8 @@ function bindCoverHoldZoom(wrapEl) {
     likedTile.addEventListener('click', () => {
       switchView('favorites');
     });
-    container.appendChild(likedTile);
+    bindRemoveFromHome(likedTile, 'liked', 'Liked songs', renderQuickAccess);
+    if (!hidden.has('liked')) container.appendChild(likedTile);
 
     const rawHist = Array.isArray(state.history) ? state.history : [];
     const seenTracks = new Set();
@@ -25907,6 +25955,7 @@ function bindCoverHoldZoom(wrapEl) {
       const canId = (typeof getTrackCanonicalId === 'function' ? getTrackCanonicalId(t) : '') || t.id || `${t.artist || ''}::${t.title || ''}`;
       if (!canId || seenTracks.has(canId)) continue;
       seenTracks.add(canId);
+      if (hidden.has(homeTrackKey(t))) continue;
       recentTracks.push(t);
       if (recentTracks.length >= 5) break;
     }
@@ -25934,12 +25983,13 @@ function bindCoverHoldZoom(wrapEl) {
       tile.addEventListener('click', () => {
         playTrack(track);
       });
+      bindRemoveFromHome(tile, homeTrackKey(track), track.title || 'Untitled', renderQuickAccess);
       container.appendChild(tile);
     });
 
     if (recentTracks.length < 5 && Array.isArray(state.playlists)) {
       const needed = 5 - recentTracks.length;
-      const playlists = state.playlists.slice(0, needed);
+      const playlists = state.playlists.filter(pl => !hidden.has('playlist:' + pl.id)).slice(0, needed);
       playlists.forEach(pl => {
         const tile = document.createElement('div');
         tile.className = 'sp-tile';
@@ -25964,9 +26014,11 @@ function bindCoverHoldZoom(wrapEl) {
         tile.addEventListener('click', () => {
           openPlaylistDetail(pl.id);
         });
+        bindRemoveFromHome(tile, 'playlist:' + pl.id, pl.name || 'Untitled', renderQuickAccess);
         container.appendChild(tile);
       });
     }
+    sec.hidden = container.children.length === 0;
   }
 
   function getMix4Covers(mix) {
@@ -26169,7 +26221,8 @@ function bindCoverHoldZoom(wrapEl) {
 
   function renderTrendingCards(row, tracks) {
     row.innerHTML = '';
-    const filteredTracks = (tracks || []).filter(t => !isTrackBlocked(t) && !isArtistBlocked(t.artist));
+    const hidden = getHomeHidden();
+    const filteredTracks = (tracks || []).filter(t => !isTrackBlocked(t) && !isArtistBlocked(t.artist) && !hidden.has(homeTrackKey(t)));
     filteredTracks.forEach((track, idx) => {
       const card = spCard({
         cover: (typeof getTrackThumbUrl === 'function' ? getTrackThumbUrl(track) : '') || track.thumbnail || track.cover || '',
@@ -26181,6 +26234,7 @@ function bindCoverHoldZoom(wrapEl) {
           playTrack(track, [...filteredTracks], idx);
         }
       });
+      bindRemoveFromHome(card, homeTrackKey(track), track.title || 'Untitled', () => renderTrendingCards(row, tracks));
       row.appendChild(card);
     });
     bindHorizontalWheel(row);
@@ -26424,9 +26478,14 @@ function bindCoverHoldZoom(wrapEl) {
       myWaveCard.appendChild(subEl);
       myWaveCard.addEventListener('click', playMyWave);
     }
-    row.appendChild(myWaveCard);
+    const hidden = getHomeHidden();
+    bindRemoveFromHome(myWaveCard, 'foryou', 'For you', renderMadeForYou);
+    if (!hidden.has('foryou')) row.appendChild(myWaveCard);
 
     mixes.forEach((mix, i) => {
+      // A mix is removed by its name ("Daily Mix 3"): the songs in it change every day.
+      const mixKey = 'mix:' + (mix.title || `Daily Mix ${i + 1}`);
+      if (hidden.has(mixKey)) return;
       const fourCovers = getMix4Covers(mix);
       const cover = coverCandidatesFromTracks(mix.tracks);
       const sub = (mix.artists && mix.artists.length > 0) ? mix.artists.join(', ') : '';
@@ -26450,6 +26509,7 @@ function bindCoverHoldZoom(wrapEl) {
           }
         }
       });
+      bindRemoveFromHome(card, mixKey, mix.title || `Daily Mix ${i + 1}`, renderMadeForYou);
       row.appendChild(card);
     });
 
@@ -26505,8 +26565,10 @@ function bindCoverHoldZoom(wrapEl) {
       sec.style.display = 'none';
       return;
     }
-    const artists = getFavoriteArtistsList();
-    if (!artists || artists.length === 0) {
+    const hidden = getHomeHidden();
+    const artistKey = (a) => 'artist:' + String(a.name || '').trim().toLowerCase();
+    const artists = (getFavoriteArtistsList() || []).filter(a => !hidden.has(artistKey(a)));
+    if (artists.length === 0) {
       sec.style.display = 'none';
       return;
     }
@@ -26516,6 +26578,7 @@ function bindCoverHoldZoom(wrapEl) {
     const toFetch = [];
     artists.forEach(a => {
       const card = buildFavArtistCircleCard(a, false, 0, false);
+      bindRemoveFromHome(card, artistKey(a), a.name || 'Artist', renderFavArtistsHome);
       frag.appendChild(card);
       if (!a.avatar || !a.fans) {
         toFetch.push({ artist: a, card });

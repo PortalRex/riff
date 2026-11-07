@@ -1321,7 +1321,10 @@
                   <span class="setting-name">Customize sidebar & home layout</span>
                   <span style="font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);">Drag and drop to reorder sidebar navigation items and home page sections</span>
                 </div>
-                <button type="button" class="btn-outline-pill" id="btn-reset-sidebar-order" style="height: 30px; padding: 0 12px; font-size: 12px;">Reset</button>
+                <div style="display: flex; gap: 8px;">
+                  <button type="button" class="btn-outline-pill" id="btn-restore-home-hidden" title="Bring back everything removed from the home page with right-click" style="display: none; height: 30px; padding: 0 12px; font-size: 12px;">Restore removed</button>
+                  <button type="button" class="btn-outline-pill" id="btn-reset-sidebar-order" style="height: 30px; padding: 0 12px; font-size: 12px;">Reset</button>
+                </div>
               </div>
 
               <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
