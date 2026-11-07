@@ -19968,7 +19968,8 @@ function bindCoverHoldZoom(wrapEl) {
       return { cleanText: text, bannerUrl };
     }
 
-    function populateOtaUpdateSheet(info) {
+    // manual: shown even for a version "Later" skipped (the user pressed Check for updates).
+    function populateOtaUpdateSheet(info, manual = false) {
       const modal = document.getElementById('update-modal');
       const sheet = document.getElementById('update-sheet-card');
       const spinnerBox = document.getElementById('update-center-spinner');
@@ -19982,7 +19983,7 @@ function bindCoverHoldZoom(wrapEl) {
 
       const rawVer = String(info?.version || '').replace(/^v/i, '');
       const ignoredVer = localStorage.getItem('riff_ignored_update_ver') || '';
-      if (!manualUpdateCheck && rawVer && ignoredVer === rawVer) return;
+      if (!manualUpdateCheck && !manual && rawVer && ignoredVer === rawVer) return;
 
       const displayVer = rawVer.endsWith('.0.0') ? ('v' + rawVer.slice(0, -4)) : (rawVer.endsWith('.0') ? ('v' + rawVer.slice(0, -2)) : ('v' + rawVer));
       if (verEl) verEl.textContent = displayVer || 'v44.1.1';
@@ -20013,6 +20014,7 @@ function bindCoverHoldZoom(wrapEl) {
       sheet.classList.remove('leaving');
       if (spinnerBox) spinnerBox.classList.add('hidden');
       modal.classList.remove('hidden');
+      modal.classList.add('visible'); // .modal-backdrop stays invisible without it
     }
 
     function restoreButton() {
@@ -20105,6 +20107,7 @@ function bindCoverHoldZoom(wrapEl) {
     }
 
     const handleUpdateAvailable = async (info) => {
+      const wasManual = manualUpdateCheck;
       restoreButton();
       latestUpdateInfo = { ...(info || {}) };
       canNativeInstall = !!info?.canInstall;
@@ -20127,7 +20130,7 @@ function bindCoverHoldZoom(wrapEl) {
         } catch (_) {}
       }
 
-      populateOtaUpdateSheet(latestUpdateInfo);
+      populateOtaUpdateSheet(latestUpdateInfo, wasManual);
     };
     if (api && api.onUpdateAvailable) api.onUpdateAvailable(handleUpdateAvailable);
 
@@ -20260,7 +20263,10 @@ function bindCoverHoldZoom(wrapEl) {
         const modal = document.getElementById('update-modal');
         if (sheet) sheet.classList.add('leaving');
         setTimeout(() => {
-          if (modal) modal.classList.add('hidden');
+          if (modal) {
+            modal.classList.add('hidden');
+            modal.classList.remove('visible');
+          }
         }, 260);
       });
     }
