@@ -4994,7 +4994,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       const hasSync = state.syncedLyrics && state.syncedLyrics.some(p => p.time >= 0);
-      if (state.isCustomLyrics && !hasSync) return;
+      if ((state.isCustomLyrics || state.lyricsPickedFrom) && !hasSync) return;
       if (hasSync) {
         const countDiff = Math.abs(state.syncedLyrics.length - data.lines.length) / Math.max(state.syncedLyrics.length, data.lines.length);
         if (countDiff > 0.15) {
@@ -5153,6 +5153,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     state.forceSnapLyrics = true;
     state.syncedLyrics = [];
     state.isCustomLyrics = false;
+    state.currentLyricsRaw = '';
+    state.lyricsPickedFrom = '';
+    state.lyricsOverridden = false;
     if (typeof renderMiniLyrics === 'function') renderMiniLyrics();
 
     try {
@@ -5184,6 +5187,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       if (token !== state.loadToken || (state.currentTrack && (state.currentTrack.title || '') !== title)) return;
+
+      state.currentLyricsRaw = (data && data.lyrics) || '';
+      state.lyricsPickedFrom = (data && data.pickedFrom) || '';
+      state.lyricsOverridden = !!(data && (data.isCustom || data.pickedFrom));
 
       if (data && (data.isExplicit || (typeof isLyricsExplicit === 'function' && isLyricsExplicit(data.lyrics))) && state.currentTrack) {
         state.currentTrack.isExplicit = true;
@@ -7856,6 +7863,216 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (el.customLyricsModal) {
     el.customLyricsModal.addEventListener('click', (e) => {
       if (e.target === el.customLyricsModal) closeCustomLyricsEditor();
+    });
+  }
+
+  // Change lyrics: list what every lyrics provider has for the playing song and use the one the
+  // user picks, for that song only. Picked lyrics are stored like custom lyrics with a tag line,
+  // so they keep the normal timing; "Back to automatic" deletes them again.
+  const LYRICS_PROVIDER_NAMES = { lrclib: 'LRCLIB', musixmatch: 'Musixmatch', kugou: 'Kugou', netease: 'NetEase', genius: 'Genius' };
+  const lyricsPicker = {
+    modal: document.getElementById('lyrics-picker-modal'),
+    list: document.getElementById('lyrics-picker-list'),
+    preview: document.getElementById('lyrics-picker-preview'),
+    form: document.getElementById('lyrics-picker-search'),
+    titleInput: document.getElementById('lyrics-picker-title'),
+    artistInput: document.getElementById('lyrics-picker-artist'),
+    btnUse: document.getElementById('btn-lyrics-picker-use'),
+    btnNone: document.getElementById('btn-lyrics-picker-none'),
+    btnAuto: document.getElementById('btn-lyrics-picker-auto'),
+    btnEdit: document.getElementById('btn-lyrics-picker-edit'),
+    btnClose: document.getElementById('btn-close-lyrics-picker'),
+    track: null,
+    options: [],
+    selected: -1,
+    searchToken: 0
+  };
+
+  function lyricsPlainText(raw) {
+    return String(raw || '')
+      .split('\n')
+      .map(line => line.replace(/^\s*(\[\d+:\d+(?:[.:]\d+)?\])+/, '').replace(/<\d+:\d+(?:[.:]\d+)?>/g, '').trim())
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function formatPickerDuration(sec) {
+    const total = Math.round(Number(sec) || 0);
+    if (!total) return '';
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  }
+
+  function selectLyricsPickerOption(index) {
+    lyricsPicker.selected = index;
+    const opt = lyricsPicker.options[index];
+    lyricsPicker.list.querySelectorAll('.lyrics-picker-option').forEach((btn, i) => btn.classList.toggle('selected', i === index));
+    lyricsPicker.preview.textContent = opt ? lyricsPlainText(opt.lyrics) : '';
+    lyricsPicker.preview.scrollTop = 0;
+    lyricsPicker.btnUse.disabled = !opt;
+  }
+
+  function renderLyricsPickerOptions() {
+    const { list, options } = lyricsPicker;
+    list.innerHTML = '';
+    if (!options.length) {
+      const empty = document.createElement('div');
+      empty.className = 'lyrics-picker-empty';
+      empty.textContent = 'No lyrics found. Try a different title or artist above.';
+      list.appendChild(empty);
+      selectLyricsPickerOption(-1);
+      return;
+    }
+    options.forEach((opt, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'lyrics-picker-option';
+      const title = document.createElement('span');
+      title.className = 'lyrics-picker-option-title';
+      title.textContent = opt.title || 'Unknown song';
+      if (state.currentLyricsRaw && opt.lyrics === state.currentLyricsRaw) {
+        const tag = document.createElement('span');
+        tag.className = 'lyrics-picker-tag';
+        tag.textContent = 'In use';
+        title.appendChild(tag);
+      }
+      const meta = document.createElement('span');
+      meta.className = 'lyrics-picker-option-meta';
+      meta.textContent = [
+        opt.artist,
+        LYRICS_PROVIDER_NAMES[opt.provider] || opt.provider,
+        opt.synced ? 'Synced' : 'Not synced',
+        formatPickerDuration(opt.duration)
+      ].filter(Boolean).join(' · ');
+      btn.append(title, meta);
+      btn.addEventListener('click', () => selectLyricsPickerOption(i));
+      btn.addEventListener('dblclick', () => { selectLyricsPickerOption(i); useLyricsPickerSelection(); });
+      list.appendChild(btn);
+    });
+  }
+
+  async function searchLyricsPicker() {
+    const token = ++lyricsPicker.searchToken;
+    const title = lyricsPicker.titleInput.value.trim();
+    const artist = lyricsPicker.artistInput.value.trim();
+    lyricsPicker.options = [];
+    lyricsPicker.list.innerHTML = '<div class="lyrics-picker-empty">Searching...</div>';
+    selectLyricsPickerOption(-1);
+    let options = [];
+    try {
+      const duration = lyricsPicker.track && lyricsPicker.track.duration ? `&duration=${encodeURIComponent(lyricsPicker.track.duration)}` : '';
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/lyrics-options?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}${duration}`);
+      const data = await res.json();
+      options = (data && Array.isArray(data.options)) ? data.options : [];
+    } catch (_) {}
+    if (token !== lyricsPicker.searchToken) return;
+    lyricsPicker.options = options;
+    renderLyricsPickerOptions();
+    if (options.length) {
+      const inUse = options.findIndex(o => state.currentLyricsRaw && o.lyrics === state.currentLyricsRaw);
+      selectLyricsPickerOption(inUse >= 0 ? inUse : 0);
+    }
+  }
+
+  function openLyricsPicker() {
+    if (!state.currentTrack || !lyricsPicker.modal) {
+      showToast('Play a track first to change its lyrics', 'info');
+      return;
+    }
+    lyricsPicker.track = state.currentTrack;
+    lyricsPicker.titleInput.value = state.currentTrack.title || '';
+    lyricsPicker.artistInput.value = state.currentTrack.artist || '';
+    lyricsPicker.btnAuto.disabled = !state.lyricsOverridden;
+    openModal(lyricsPicker.modal);
+    searchLyricsPicker();
+  }
+
+  function closeLyricsPicker() {
+    lyricsPicker.searchToken++;
+    if (lyricsPicker.modal) closeModal(lyricsPicker.modal);
+  }
+
+  // Saves (or resets) the lyrics of one song, then reloads the lyrics panel if it is still playing.
+  async function saveLyricsChoice(track, body, doneMessage) {
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${state.serverPort}/api/save-custom-lyrics?title=${encodeURIComponent(track.title || '')}&artist=${encodeURIComponent(track.artist || '')}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      );
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Save failed');
+    } catch (e) {
+      showToast('Could not change the lyrics: ' + e.message, 'error');
+      return false;
+    }
+    lyricsSessionCache.clear();
+    wordsSessionCache.clear();
+    showToast(doneMessage, 'info');
+    const cur = state.currentTrack;
+    if (cur && (cur.title || '') === (track.title || '') && (cur.artist || '') === (track.artist || '')) {
+      state.lastActiveLyricIdx = -1;
+      state.forceLyricsScroll = true;
+      state.forceSnapLyrics = true;
+      await loadSyncedLyrics(cur.title || '', cur.artist || '', state.loadToken);
+    }
+    return true;
+  }
+
+  async function useLyricsPickerSelection() {
+    const opt = lyricsPicker.options[lyricsPicker.selected];
+    if (!opt || !lyricsPicker.track) return;
+    const track = lyricsPicker.track;
+    closeLyricsPicker();
+    const name = LYRICS_PROVIDER_NAMES[opt.provider] || opt.provider;
+    await saveLyricsChoice(track, { lyrics: `[by:riff-pick:${opt.provider}]\n${opt.lyrics}` }, `Using ${name} lyrics for this song`);
+  }
+
+  function resetLyricsToAutomatic(track) {
+    if (!track) return;
+    return saveLyricsChoice(track, { reset: true }, 'Lyrics are found automatically again');
+  }
+
+  if (lyricsPicker.modal) {
+    lyricsPicker.form.addEventListener('submit', (e) => { e.preventDefault(); searchLyricsPicker(); });
+    lyricsPicker.btnClose.addEventListener('click', closeLyricsPicker);
+    lyricsPicker.btnUse.addEventListener('click', useLyricsPickerSelection);
+    lyricsPicker.btnNone.addEventListener('click', async () => {
+      const track = lyricsPicker.track;
+      closeLyricsPicker();
+      if (track) await saveLyricsChoice(track, { lyrics: '' }, 'Lyrics hidden for this song');
+    });
+    lyricsPicker.btnAuto.addEventListener('click', async () => {
+      const track = lyricsPicker.track;
+      closeLyricsPicker();
+      await resetLyricsToAutomatic(track);
+    });
+    lyricsPicker.btnEdit.addEventListener('click', () => {
+      const opt = lyricsPicker.options[lyricsPicker.selected];
+      closeLyricsPicker();
+      openCustomLyricsEditor();
+      if (opt && el.customLyricsTextarea) el.customLyricsTextarea.value = lyricsPlainText(opt.lyrics);
+    });
+    lyricsPicker.modal.addEventListener('click', (e) => {
+      if (e.target === lyricsPicker.modal) closeLyricsPicker();
+    });
+    const btnChangeLyrics = document.getElementById('btn-change-lyrics');
+    if (btnChangeLyrics) btnChangeLyrics.addEventListener('click', openLyricsPicker);
+  }
+
+  if (el.lyricsContainer) {
+    el.lyricsContainer.addEventListener('contextmenu', (e) => {
+      if (!state.currentTrack) return;
+      e.preventDefault();
+      const track = state.currentTrack;
+      const swapIcon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>';
+      const editIcon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>';
+      const resetIcon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path><path d="M3 3v5h5"></path></svg>';
+      const items = [
+        { icon: swapIcon, label: 'Change lyrics', action: openLyricsPicker },
+        { icon: editIcon, label: 'Edit lyrics', action: openCustomLyricsEditor }
+      ];
+      if (state.lyricsOverridden) items.push({ icon: resetIcon, label: 'Back to automatic lyrics', action: () => resetLyricsToAutomatic(track) });
+      showCtxMenuItems(e, items);
     });
   }
 
