@@ -4337,40 +4337,60 @@ document.addEventListener('DOMContentLoaded', async () => {
     fetch(streamUrl, { headers: { 'Range': 'bytes=0-262143' } }).catch(() => {});
   }
 
-  // Shuffle plans its next few songs when the current one starts rather than picking at random
-  // when Next is pressed, so those songs can be preloaded like the next ones in an unshuffled queue.
   const PRELOAD_AHEAD = 3;
 
-  function pickShuffleIndex(exclude) {
-    const eligible = state.queue.map((track, index) => index)
-      .filter(index => index !== state.queueIndex && !exclude.has(index) && !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
-    if (eligible.length === 0) return -1;
-    const recent = new Set(state.queueHistory.slice(-Math.max(1, Math.floor(eligible.length / 2))));
-    const pool = eligible.filter(index => !recent.has(index));
-    const candidates = pool.length ? pool : eligible;
-    return candidates[Math.floor(Math.random() * candidates.length)];
-  }
-
-  // The planned upcoming shuffle indices. The plan is dropped when it was made for another song or
-  // the queue changed under it, and topped up to `count` songs.
-  function plannedShuffleIndices(count) {
-    let plan = state.shufflePlan;
-    const valid = plan && plan.after === state.queueIndex && plan.entries.every(e => state.queue[e.index] === e.track);
-    if (!valid) plan = state.shufflePlan = { after: state.queueIndex, entries: [] };
-    while (plan.entries.length < count) {
-      const index = pickShuffleIndex(new Set(plan.entries.map(e => e.index)));
-      if (index < 0) break;
-      plan.entries.push({ index, track: state.queue[index] });
+  // Shuffle reorders the queue itself: the song playing first, then the others at random. The queue
+  // then lists what really plays next, and Play next, Add to queue and dragging work as without
+  // shuffle. The order from before is kept and put back when shuffle is turned off.
+  function shuffleArrayInPlace(list) {
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
     }
-    return plan.entries.slice(0, count).map(e => e.index);
+    return list;
   }
 
-  // Next in shuffle: the first planned song; the rest of the plan carries over to it.
-  function takePlannedShuffleIndex() {
-    const [index] = plannedShuffleIndices(1);
-    if (index === undefined) return -1;
-    state.shufflePlan = { after: index, entries: state.shufflePlan.entries.slice(1) };
-    return index;
+  // keepOriginal: a new round of the same shuffled queue keeps the order to go back to.
+  function shuffleQueue(keepOriginal = false) {
+    if (!Array.isArray(state.queue) || state.queue.length < 2) return;
+    if (!keepOriginal || !state.unshuffledQueue) state.unshuffledQueue = state.queue.slice();
+    const current = state.queueIndex >= 0 ? state.queue[state.queueIndex] : null;
+    const others = shuffleArrayInPlace(state.queue.filter((_, i) => i !== state.queueIndex));
+    state.queue = current ? [current, ...others] : others;
+    state.queueIndex = current ? 0 : -1;
+    state.queueHistory = current ? [0] : [];
+  }
+
+  function unshuffleQueue() {
+    const original = state.unshuffledQueue;
+    state.unshuffledQueue = null;
+    if (!original || !Array.isArray(state.queue) || state.queue.length === 0) return;
+    const current = state.queueIndex >= 0 ? state.queue[state.queueIndex] : null;
+    const inQueue = new Set(state.queue);
+    const restored = original.filter(track => inQueue.has(track));
+    const known = new Set(restored);
+    // Songs added while shuffled: the ones queued right after the current song stay next,
+    // the rest go to the end.
+    const playNextRun = [];
+    for (let i = state.queueIndex + 1; i < state.queue.length && !known.has(state.queue[i]); i++) playNextRun.push(state.queue[i]);
+    const inRun = new Set(playNextRun);
+    const atEnd = state.queue.filter(track => !known.has(track) && !inRun.has(track) && track !== current);
+    if (current && !known.has(current)) restored.push(current);
+    const at = current ? restored.indexOf(current) : -1;
+    restored.splice(at + 1, 0, ...playNextRun);
+    restored.push(...atEnd);
+    state.queue = restored;
+    state.queueIndex = current ? restored.indexOf(current) : -1;
+    state.queueHistory = state.queueIndex >= 0 ? [state.queueIndex] : [];
+  }
+
+  // Next in shuffle: the next song in the shuffled queue; at its end, another shuffled round.
+  function nextShuffledIndex() {
+    const playable = (i) => state.queue[i] && !isTrackBlocked(state.queue[i]) && !isArtistBlocked(state.queue[i].artist);
+    for (let i = state.queueIndex + 1; i < state.queue.length; i++) if (playable(i)) return i;
+    shuffleQueue(true);
+    for (let i = state.queueIndex + 1; i < state.queue.length; i++) if (playable(i)) return i;
+    return -1;
   }
 
   // Preloads the next few songs one after another (each can take seconds), nearest first.
@@ -4378,9 +4398,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!state.queue || state.queueIndex < 0) return;
     const run = (state._preloadRun || 0) + 1;
     state._preloadRun = run;
-    const upcoming = (state.isShuffle && !shuffleProvider)
-      ? plannedShuffleIndices(PRELOAD_AHEAD).map(index => state.queue[index])
-      : state.queue.slice(state.queueIndex + 1, state.queueIndex + 1 + PRELOAD_AHEAD);
+    const upcoming = state.queue.slice(state.queueIndex + 1, state.queueIndex + 1 + PRELOAD_AHEAD);
     for (let i = 0; i < upcoming.length; i++) {
       if (state._preloadRun !== run) return; // a newer song started; it preloads its own
       await preloadTrackStream(upcoming[i], i === 0);
@@ -4589,6 +4607,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     state.currentTrackIndexInContext = startIndex;
 
     if (queueList) {
+      const pickedFromQueue = queueList === state.queue;
       state.queue = [...queueList];
       if (startIndex >= 0 && startIndex < state.queue.length && isSameTrack(state.queue[startIndex], track)) {
         state.queueIndex = startIndex;
@@ -4600,6 +4619,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         state.queueIndex = 0;
       }
       state.queueHistory = [state.queueIndex];
+      if (!pickedFromQueue) {
+        state.unshuffledQueue = null;
+        if (state.isShuffle && !shuffleProvider) shuffleQueue();
+      }
     } else {
       const existingIndex = state.queue.findIndex(t => isSameTrack(t, track));
       if (existingIndex === -1) {
@@ -8627,7 +8650,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
       if (state.queue.length === 0) return;
-      if (nextIdx < 0 && !provider) nextIdx = takePlannedShuffleIndex();
+      if (nextIdx < 0 && !provider) nextIdx = nextShuffledIndex();
       if (nextIdx < 0) {
         const eligible = state.queue.map((track, index) => index)
           .filter(index => !isTrackBlocked(state.queue[index]) && !isArtistBlocked(state.queue[index]?.artist));
@@ -15284,6 +15307,14 @@ function bindCoverHoldZoom(wrapEl) {
       state.isShuffle = !state.isShuffle;
       localStorage.setItem('riff_shuffle', state.isShuffle ? '1' : '0');
       el.btnShuffle.classList.toggle('active', state.isShuffle);
+      if (state.isShuffle) {
+        if (!shuffleProvider) shuffleQueue();
+      } else {
+        unshuffleQueue();
+      }
+      updateQueueBadge();
+      if (state.currentView === 'queue') renderQueueView();
+      if (typeof preloadNextTrackStream === 'function') preloadNextTrackStream();
     });
   }
 
