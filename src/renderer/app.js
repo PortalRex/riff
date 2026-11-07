@@ -14072,8 +14072,64 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
   window.openSettingsModal = openSettingsModal;
   window.closeSettingsModal = closeSettingsModal;
 
+  // Double-clicking a playlist, the liked songs, an album or an artist plays it: a random song with
+  // shuffle on, else from the top. The first click opens the list as before (switchView notes it),
+  // the second press plays it once its songs are loaded.
+  const LIST_VIEWS = new Set(['playlist-detail', 'favorites', 'album', 'artist']);
+  let lastListOpen = null;
+  function noteListOpen(viewName) {
+    lastListOpen = LIST_VIEWS.has(viewName)
+      ? { view: viewName, at: Date.now() }
+      : null;
+  }
+  function openedListTracks(open) {
+    if (state.currentView !== open.view) return null;
+    if (open.view === 'playlist-detail') {
+      const pl = state.playlists.find(p => p.id === state.currentPlaylistId);
+      return pl && pl.tracks ? { tracks: sortTracksFor('playlist', pl.tracks, pl.id), context: 'playlist' } : null;
+    }
+    if (open.view === 'favorites') return { tracks: sortTracksFor('favorites', state.favorites || []), context: 'favorites' };
+    if (open.view === 'album') {
+      // openAlbum sets state.currentAlbum before switching, and its playable songs once they load.
+      const album = state.currentAlbum;
+      return album && Array.isArray(album._tracks) && album._tracks.length && album._tracks[0].title ? { tracks: album._tracks, context: 'album' } : null;
+    }
+    // The artist's songs are fetched after the switch: wait for the loader to go and the shown name
+    // to be the loaded artist's (a failed load keeps the name it was opened with).
+    const data = state.currentArtistData;
+    if (!data || !Array.isArray(data.tracks) || !el.artistProfileName || data.name !== el.artistProfileName.textContent) return null;
+    if (el.artistTracksList && el.artistTracksList.querySelector('.m3-loader-container')) return null;
+    return { tracks: data.tracks, context: 'artist' };
+  }
+  async function playOpenedList(open) {
+    let list = null;
+    for (const started = Date.now(); Date.now() - started < 20000; await new Promise(r => setTimeout(r, 100))) {
+      if (lastListOpen !== open || state.currentView !== open.view) return; // went elsewhere meanwhile
+      list = openedListTracks(open);
+      if (list) break;
+    }
+    if (!list || list.tracks.length === 0) return;
+    const playable = list.tracks.filter(t => t && !isTrackBlocked(t) && !isArtistBlocked(t.artist));
+    if (playable.length === 0) return;
+    const start = playable[state.isShuffle ? Math.floor(Math.random() * playable.length) : 0];
+    state.isRadioQueue = false;
+    state.queueHistory = [];
+    playTrack(start, list.tracks, list.tracks.indexOf(start), list.context);
+  }
+  document.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || e.detail !== 2 || !lastListOpen || Date.now() - lastListOpen.at > 700) return;
+    const open = lastListOpen;
+    // The second click now lands on the opened view (often a song row): keep it from doing anything.
+    const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+    document.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 1000);
+    open.at = 0; // a triple click doesn't start it twice
+    playOpenedList(open);
+  }, true);
+
   function switchView(viewName) {
     if (typeof resetSettingsSearch === 'function') resetSettingsSearch();
+    noteListOpen(viewName);
     const btnSbSettings = document.getElementById('btn-sb-settings');
     if (btnSbSettings) btnSbSettings.classList.toggle('active', viewName === 'settings');
     if (viewName === 'settings') {
