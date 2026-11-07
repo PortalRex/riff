@@ -17785,6 +17785,14 @@ function bindCoverHoldZoom(wrapEl) {
         item.style.alignItems = 'stretch';
         item.appendChild(slider);
       }
+      if (s.key === 'volumeScrollStep') {
+        // An interface setting: it goes at the end of Settings > Interface, not under Storage.
+        const interfaceGroup = document.getElementById('setting-sidebar-home-customizer')?.parentElement;
+        document.getElementById('fork-volume-step-item')?.remove();
+        item.id = 'fork-volume-step-item';
+        (interfaceGroup || group).appendChild(item);
+        continue;
+      }
       group.appendChild(item);
     }
     showPlaylistSyncProgress(playlistSync);
