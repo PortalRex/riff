@@ -14975,6 +14975,8 @@ function bindCoverHoldZoom(wrapEl) {
     } catch (e) {}
   }
 
+  // Percent per wheel notch on the volume bar, a fork setting loaded by renderForkSettings.
+  let volumeScrollStep = 5;
   if (el.volumeSlider) {
     el.volumeSlider.value = String(state.volume);
     if (state.isMuted) {
@@ -14985,7 +14987,7 @@ function bindCoverHoldZoom(wrapEl) {
     volGroup.addEventListener('wheel', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      const step = e.deltaY < 0 ? 0.05 : -0.05;
+      const step = (e.deltaY < 0 ? 1 : -1) * volumeScrollStep / 100;
       state.volume = Math.max(0, Math.min(1, Math.round((state.volume + step) * 100) / 100));
       if (state.volume > 0 && state.isMuted) state.isMuted = false;
       el.volumeSlider.value = String(state.volume);
@@ -17598,6 +17600,8 @@ function bindCoverHoldZoom(wrapEl) {
       return;
     }
     if (!Array.isArray(settings)) return;
+    const volumeStep = settings.find(x => x.key === 'volumeScrollStep');
+    if (volumeStep) volumeScrollStep = volumeStep.value; // the Flow plugin may have changed it
     group.innerHTML = '';
     for (const s of settings) {
       const item = document.createElement('div');
@@ -17639,24 +17643,29 @@ function bindCoverHoldZoom(wrapEl) {
           item.style.alignItems = 'stretch';
           item.appendChild(progress);
         }
-      } else if (s.key === 'cacheLimitGB') {
+      } else if (s.key === 'cacheLimitGB' || s.key === 'volumeScrollStep') {
+        const isVolume = s.key === 'volumeScrollStep';
+        const unit = isVolume ? '%' : ' GB';
         const val = document.createElement('span');
         val.className = 'setting-val';
         val.style.cssText = 'font-size: calc(13px * var(--font-scale, 1)); font-weight: 500; min-width: 52px; text-align: right;';
-        val.textContent = `${s.value} GB`;
+        val.textContent = `${s.value}${unit}`;
         top.appendChild(val);
         const slider = document.createElement('input');
         slider.type = 'range';
         slider.className = 'pill-range';
         slider.min = '1';
-        slider.max = String(Math.max(100, s.value));
+        slider.max = isVolume ? '25' : String(Math.max(100, s.value));
         slider.step = '1';
         slider.value = String(s.value);
         slider.style.cssText = 'width: 100%; margin-top: 8px;';
-        slider.addEventListener('input', () => { val.textContent = `${slider.value} GB`; });
+        slider.addEventListener('input', () => { val.textContent = `${slider.value}${unit}`; });
         slider.addEventListener('change', async () => {
-          if (!(await saveForkSetting(s.key, Number(slider.value)))) { slider.value = String(s.value); val.textContent = `${s.value} GB`; }
-          else s.value = Number(slider.value);
+          if (!(await saveForkSetting(s.key, Number(slider.value)))) { slider.value = String(s.value); val.textContent = `${s.value}${unit}`; }
+          else {
+            s.value = Number(slider.value);
+            if (isVolume) volumeScrollStep = s.value;
+          }
         });
         item.style.flexDirection = 'column';
         item.style.alignItems = 'stretch';

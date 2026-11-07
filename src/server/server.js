@@ -491,6 +491,7 @@ const FORK_SETTINGS = {
   raceLookups: { default: true, label: 'Two lookups per song', description: 'Fetch each new song signed in and anonymous at once and keep the faster one (fewer slow songs, twice the requests)' },
   signedInSearch: { default: true, label: 'Signed-in YouTube Music search', description: 'Send your YouTube sign-in with searches (YouTube Music refuses fewer of them)' },
   cacheLimitGB: { default: 10, label: 'Cache limit (GB)', description: 'Songs played longest ago are removed above this' },
+  volumeScrollStep: { default: 5, label: 'Volume scroll step (%)', description: 'How much one notch of the mouse wheel on the volume bar changes the volume' },
 };
 let forkSettings = {};
 try { forkSettings = JSON.parse(fs.readFileSync(FORK_SETTINGS_PATH, 'utf8')) || {}; } catch (_) {}
@@ -505,6 +506,7 @@ function setForkSetting(key, value) {
   const spec = FORK_SETTINGS[key];
   if (!spec || typeof value !== typeof spec.default) return false;
   if (key === 'cacheLimitGB' && !(value >= 1 && value <= 2000)) return false;
+  if (key === 'volumeScrollStep' && !(Number.isInteger(value) && value >= 1 && value <= 25)) return false;
   forkSettings[key] = value;
   try { fs.writeFileSync(FORK_SETTINGS_PATH, JSON.stringify(forkSettings, null, 2)); } catch (_) {}
   return true;
