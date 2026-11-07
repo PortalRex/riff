@@ -2897,6 +2897,21 @@ async function ytmusicSearch(query, options = {}) {
   return [];
 }
 
+// Whether a search result is what was typed: every word of the query (punctuation ignored, words
+// of 3+ letters) is in its title, artist or album. "Godspeed You! Black Emperor" matches a GY!BE
+// upload but not "Godspeed" by another artist.
+function searchWords(text) {
+  return String(text || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9Ѐ-ӿ]+/g, ' ').trim().split(' ').filter(Boolean);
+}
+function searchResultMatchesQuery(track, query) {
+  const words = searchWords(query).filter(w => w.length >= 3);
+  if (words.length === 0) return true;
+  const have = new Set(searchWords(`${track.title || ''} ${track.artist || ''} ${track.album || ''}`));
+  // Long queries may have a typo: one word in five can be missing ("Life Your Skinny Fists...").
+  return words.filter(w => !have.has(w)).length <= Math.floor(words.length / 5);
+}
+
 async function handleSearch(req, res, query, platform = 'ytmusic', limit = 12, offset = 0) {
   limit = Math.max(1, parseInt(limit, 10) || 12);
   offset = Math.max(0, parseInt(offset, 10) || 0);
@@ -2961,6 +2976,15 @@ async function handleSearch(req, res, query, platform = 'ytmusic', limit = 12, o
       const ytmTracks = (await ytmusicSearch(qStr).catch(() => [])) || [];
       if (ytmTracks.length > 0) {
         pool = [...ytmTracks];
+        // Some artists are not on YouTube Music at all (Godspeed You! Black Emperor: only covers
+        // and other artists come back). When no result matches what was typed, YouTube's own
+        // uploads of it go first.
+        if (!ytmTracks.some(t => searchResultMatchesQuery(t, qStr))) {
+          const ytTracks = (await directYoutubeSearch(qStr, false, 40).catch(() => [])) || [];
+          const notMusic = /\b(?:reacts?|reaction|reviews?|tutorial|lesson|interview|explained)\b/i;
+          const matching = ytTracks.filter(t => searchResultMatchesQuery(t, qStr) && !notMusic.test(t.title || ''));
+          if (matching.length > 0) pool = [...matching, ...ytmTracks];
+        }
       } else {
         pool = (await directYoutubeSearch(qStr, false, 40).catch(() => [])) || [];
       }
