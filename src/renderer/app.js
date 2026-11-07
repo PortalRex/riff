@@ -4355,8 +4355,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!Array.isArray(state.queue) || state.queue.length < 2) return;
     if (!keepOriginal || !state.unshuffledQueue) state.unshuffledQueue = state.queue.slice();
     const current = state.queueIndex >= 0 ? state.queue[state.queueIndex] : null;
-    const others = shuffleArrayInPlace(state.queue.filter((_, i) => i !== state.queueIndex));
-    state.queue = current ? [current, ...others] : others;
+    // Songs added with Add to queue stay right after the current one, in their order.
+    const queued = [];
+    for (let i = state.queueIndex + 1; i < state.queue.length && state.queue[i] && state.queue[i]._userQueued; i++) queued.push(state.queue[i]);
+    const keep = new Set(queued);
+    const others = shuffleArrayInPlace(state.queue.filter((track, i) => i !== state.queueIndex && !keep.has(track)));
+    state.queue = current ? [current, ...queued, ...others] : [...queued, ...others];
     state.queueIndex = current ? 0 : -1;
     state.queueHistory = current ? [0] : [];
   }
@@ -4375,7 +4379,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     for (let i = state.queueIndex + 1; i < state.queue.length && !known.has(state.queue[i]); i++) playNextRun.push(state.queue[i]);
     const inRun = new Set(playNextRun);
     const atEnd = state.queue.filter(track => !known.has(track) && !inRun.has(track) && track !== current);
-    if (current && !known.has(current)) restored.push(current);
+    if (current && !known.has(current)) {
+      // A queued song is playing: put it after the last song from the list that played before it.
+      let anchor = -1;
+      for (let i = state.queueIndex - 1; i >= 0 && anchor < 0; i--) {
+        if (known.has(state.queue[i])) anchor = restored.indexOf(state.queue[i]);
+      }
+      restored.splice(anchor + 1, 0, current);
+    }
     const at = current ? restored.indexOf(current) : -1;
     restored.splice(at + 1, 0, ...playNextRun);
     restored.push(...atEnd);
@@ -10951,16 +10962,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast(typeof t === 'function' ? t('Added to queue') : 'Added to queue', 'success');
       return;
     }
-    state.queue.push(cloned);
+    // Queued songs play after the current one, in the order they were added, before the rest of
+    // the list (at the end of a long or shuffled list they would come hundreds of songs later).
+    cloned._userQueued = true;
+    let at = state.queueIndex + 1;
+    while (at < state.queue.length && state.queue[at] && state.queue[at]._userQueued) at++;
+    state.queue.splice(at, 0, cloned);
     if (el.queueCount) el.queueCount.textContent = String(state.queue.length);
     updateQueueBadge();
-    if (state.currentView === 'queue' && typeof renderQueueView === 'function') {
-      renderQueueView();
-    } else if (state.currentView === 'queue' && el.queueTracksList) {
-      el.queueTracksList.querySelector('.empty-hint')?.remove();
-      const qIdx = state.queue.length - 1;
-      el.queueTracksList.appendChild(createTrackRow(cloned, qIdx, () => playTrack(cloned, qIdx)));
-    }
+    if (state.currentView === 'queue' && typeof renderQueueView === 'function') renderQueueView();
+    if (at <= state.queueIndex + PRELOAD_AHEAD && typeof preloadNextTrackStream === 'function') preloadNextTrackStream();
     showToast(typeof t === 'function' ? t('Added to queue') : 'Added to queue', 'success');
   }
   window.addTrackToQueue = addTrackToQueue;
