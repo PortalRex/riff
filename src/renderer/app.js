@@ -28588,7 +28588,14 @@ function bindCoverHoldZoom(wrapEl) {
         </button>
       </div>
       <div class="np-queue-body" id="np-queue-body"></div>`;
-    document.body.appendChild(panel);
+    // The queue opens where the lyrics panel is, at the same size, and takes its place while open.
+    const rightPanel = document.getElementById('right-panel');
+    if (rightPanel && rightPanel.parentNode) {
+      panel.classList.add('docked');
+      rightPanel.after(panel);
+    } else {
+      document.body.appendChild(panel);
+    }
 
     const body = panel.querySelector('#np-queue-body');
     const tabsNav = panel.querySelector('#np-queue-tabs');
@@ -28707,9 +28714,22 @@ function bindCoverHoldZoom(wrapEl) {
       requestAnimationFrame(updateTabLine);
     };
 
+    const lyricsBtn = document.getElementById('btn-toggle-lyrics-panel');
     const setOpen = (open) => {
       panel.classList.toggle('open', open);
       btn.classList.toggle('active', open);
+      if (panel.classList.contains('docked')) {
+        document.body.classList.toggle('queue-docked', open);
+        // The lyrics button shows as off while the queue covers the lyrics.
+        if (lyricsBtn) lyricsBtn.classList.toggle('active', !open && !!state.isRightPanelOpen);
+        if (!open && state.isRightPanelOpen) {
+          state.forceSnapLyrics = true;
+          state.forceLyricsScroll = true;
+          state.lastActiveLyricIdx = -1;
+          if (el.nativeAudio) updateSyncedLyricsHighlight(el.nativeAudio.currentTime || 0);
+        }
+        setTimeout(resizeCanvases, 150);
+      }
       localStorage.setItem('riff_queue_panel_open', open ? '1' : '0');
       signature = '';
       refresh(false);
@@ -28717,6 +28737,14 @@ function bindCoverHoldZoom(wrapEl) {
     };
 
     btn.addEventListener('click', () => setOpen(!panel.classList.contains('open')));
+    // The lyrics button while the queue is open: back to the lyrics (opening them if they were closed).
+    if (lyricsBtn && panel.classList.contains('docked')) {
+      lyricsBtn.addEventListener('click', (e) => {
+        if (!panel.classList.contains('open')) return;
+        setOpen(false);
+        if (state.isRightPanelOpen) e.stopImmediatePropagation();
+      }, true);
+    }
     panel.querySelector('.np-queue-close').addEventListener('click', () => setOpen(false));
     panel.querySelectorAll('.np-queue-tab').forEach(tabBtn => {
       tabBtn.addEventListener('click', () => {

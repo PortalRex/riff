@@ -10975,6 +10975,39 @@ body.perf .np-queue-panel { transition: none !important; backdrop-filter: none !
 .np-queue-artist { font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-on-surface-variant); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .np-queue-empty { padding: 36px 16px; text-align: center; font-size: calc(13px * var(--font-scale, 1)); color: var(--md-sys-color-outline); }
 #btn-toggle-queue-panel.active { color: var(--md-sys-color-primary); }
+/* Docked: the queue sits where the lyrics panel is, at its size, instead of floating over the page. */
+body #np-queue-panel.np-queue-panel.docked {
+  position: relative;
+  top: auto;
+  right: auto;
+  bottom: auto;
+  width: var(--right-panel-width, 340px);
+  min-width: 260px;
+  max-width: min(720px, calc(100vw - 300px));
+  flex-shrink: 0;
+  align-self: stretch;
+  border-radius: 28px;
+  background: var(--md-sys-color-surface-container-low) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  z-index: auto;
+  display: none;
+  opacity: 1;
+  transform: none;
+  visibility: visible;
+  pointer-events: auto;
+  transition: none;
+}
+body #np-queue-panel.np-queue-panel.docked.open {
+  display: flex;
+  animation: npQueueDockIn 240ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+body.perf #np-queue-panel.np-queue-panel.docked.open { animation: none; }
+body.queue-docked #right-panel { display: none !important; }
+@keyframes npQueueDockIn {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
 
 .spotify-promo {
   display: flex;
