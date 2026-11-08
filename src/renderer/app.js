@@ -21766,6 +21766,16 @@ function bindCoverHoldZoom(wrapEl) {
     try { localStorage.setItem(SPOTIFY_SYNC_KEY, JSON.stringify(seen)); } catch (_) {}
   }
 
+  // True for a song that came into Riff from Spotify (import or sync): its id is the Spotify id
+  // or an "sp_" id. Songs added in Riff have their own ids and are never removed by a sync, even
+  // when the same song is on Spotify.
+  function cameFromSpotify(track) {
+    if (!track) return false;
+    if (track.fromSpotify) return true;
+    const id = String(track.id || '');
+    return id.startsWith('sp_') || (!!track.spotifyId && id === track.spotifyId);
+  }
+
   // Brings a Riff list (liked songs or a playlist's tracks, changed in place) up to the Spotify
   // list. prevIds = the Spotify ids seen last time, or null for a plain import (add what is
   // missing, remove nothing).
@@ -21783,7 +21793,9 @@ function bindCoverHoldZoom(wrapEl) {
     for (const sp of spTracks) {
       const have = (sp.id && byId.get(sp.id)) || byName.get(duplicateNameKey(sp));
       if (have) {
-        if (sp.id && !have.spotifyId) have.spotifyId = sp.id; // so a later removal on Spotify finds it
+        // Export-file imports have no Spotify ids: give them the id so a later removal on Spotify
+        // finds them. A song added in Riff keeps none, so it is never removed.
+        if (sp.id && !have.spotifyId && cameFromSpotify(have)) have.spotifyId = sp.id;
         continue;
       }
       if (prev && sp.id && prev.has(sp.id)) continue; // removed in Riff since the last sync
@@ -21793,13 +21805,13 @@ function bindCoverHoldZoom(wrapEl) {
       missing.push(sp);
     }
     const added = missing.length > 0 ? await matchSpotifyTracks(missing, { silent: true }) : [];
-    list.push(...added.map(stampAddedAt));
+    list.push(...added.map(t => { t.fromSpotify = true; return stampAddedAt(t); }));
     let removed = 0;
     if (prev) {
       const now = new Set(spTracks.map(sp => sp.id).filter(Boolean));
       for (let i = list.length - 1; i >= 0; i--) {
         const id = list[i].spotifyId;
-        if (id && prev.has(id) && !now.has(id)) { list.splice(i, 1); removed++; }
+        if (id && prev.has(id) && !now.has(id) && cameFromSpotify(list[i])) { list.splice(i, 1); removed++; }
       }
     }
     return { added: added.length, removed };
