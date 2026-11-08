@@ -8295,7 +8295,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let frozenCurTime = 0;
   let smoothFadeToken = 0;
   let isAppClosing = false;
-  window.addEventListener('beforeunload', () => { isAppClosing = true; });
+  window.addEventListener('beforeunload', () => { isAppClosing = true; saveResumePosition(true); });
 
   function pauseSmooth() {
     stopCrossfadeTail();
@@ -8363,6 +8363,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function playSmooth() {
+    if (state._resumeAt && state._resumeAt.token === state.loadToken) {
+      finishResumeLoad();
+      return;
+    }
     const curToken = ++smoothFadeToken;
     isPauseFading = false;
     state.isPlaying = true;
@@ -8994,6 +8998,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     el.nativeAudio.addEventListener('pause', () => {
       if (state.isLoadingTrack || activeStreamRecovery) return;
+      saveResumePosition(true);
       clearPlaybackStallTimer();
       isPauseFading = false;
       emitPluginEvent('pause');
@@ -9105,6 +9110,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     lastTimeupdateSec = -1;
     el.nativeAudio.addEventListener('timeupdate', () => {
+      if (!el.nativeAudio.paused) saveResumePosition();
       if (!preloadedTrack10sFired && el.nativeAudio && el.nativeAudio.currentTime >= 10) {
         preloadedTrack10sFired = true;
         preloadNextTrackStream();
@@ -13069,6 +13075,116 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
   function updateQueueBadge() {
     setNavCount(el.queueCount, state.queue.length);
     if (typeof renderSidebarLibraryFeed === 'function') renderSidebarLibraryFeed();
+    saveResumeQueueSoon();
+  }
+
+  // ---- Resume after a restart ----------------------------------------------------------------
+  // The song, the queue and the position are saved to the Riff Data folder (through the local
+  // server, so the big settings file is not rewritten every few seconds). On the next start the
+  // song is loaded paused at that position, with the same queue.
+  const RESUME_QUEUE_MAX = 1500;
+  let resumeQueueTimer = null;
+  let resumeLastPosSave = 0;
+  let resumeRestoring = true; // nothing is saved until the start-up restore has run
+
+  function slimResumeTrack(track) {
+    if (!track || typeof track !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(track)) {
+      if (k.startsWith('_') && k !== '_userQueued') continue; // stream urls and retry state go stale
+      if (typeof v === 'function') continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  function postResumeState(data) {
+    if (!state.serverPort) return;
+    fetch(`http://127.0.0.1:${state.serverPort}/api/resume-state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    }).catch(() => {});
+  }
+
+  function saveResumeQueueSoon() {
+    if (resumeRestoring) return;
+    if (resumeQueueTimer) clearTimeout(resumeQueueTimer);
+    resumeQueueTimer = setTimeout(() => {
+      resumeQueueTimer = null;
+      if (!state.currentTrack) return;
+      let queue = Array.isArray(state.queue) ? state.queue : [];
+      let queueIndex = state.queueIndex;
+      if (queue.length > RESUME_QUEUE_MAX) { // keep the part around the current song
+        const start = Math.max(0, Math.min(queueIndex - 100, queue.length - RESUME_QUEUE_MAX));
+        queue = queue.slice(start, start + RESUME_QUEUE_MAX);
+        queueIndex -= start;
+      }
+      postResumeState({
+        kind: 'queue',
+        track: slimResumeTrack(state.currentTrack),
+        queue: queue.map(slimResumeTrack).filter(Boolean),
+        queueIndex,
+        context: state.currentTrackContext || null
+      });
+    }, 1500);
+  }
+
+  function saveResumePosition(force = false) {
+    if (resumeRestoring || !state.currentTrack || !el.nativeAudio) return;
+    const now = Date.now();
+    if (!force && now - resumeLastPosSave < 5000) return;
+    resumeLastPosSave = now;
+    const position = Number.isFinite(el.nativeAudio.currentTime) ? el.nativeAudio.currentTime : 0;
+    postResumeState({ kind: 'position', id: state.currentTrack.id || '', title: state.currentTrack.title || '', position });
+  }
+
+  // Called from playSmooth for the restored song: stay paused, at the saved position.
+  function finishResumeLoad() {
+    const at = state._resumeAt.position;
+    state._resumeAt = null;
+    const audio = el.nativeAudio;
+    const seek = () => {
+      try {
+        const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+        if (at > 1 && (!dur || at < dur - 2)) audio.currentTime = at;
+      } catch (_) {}
+    };
+    if (audio.readyState >= 1) seek();
+    else audio.addEventListener('loadedmetadata', seek, { once: true });
+    state.isLoadingTrack = false;
+    state.isPlaying = false;
+    document.body.classList.remove('is-playing');
+    updatePlayPauseButton(false, false);
+    if (el.trackLoadingOverlay) el.trackLoadingOverlay.classList.add('hidden');
+    const text = formatDuration(Math.floor(at || 0));
+    if (el.timeCurrent) el.timeCurrent.textContent = text;
+    if (el.tvkTimeCurrent) el.tvkTimeCurrent.textContent = text;
+  }
+
+  async function restoreResumeState() {
+    try {
+      if (state.currentTrack || !state.serverPort) return; // something is already playing
+      const data = await (await fetch(`http://127.0.0.1:${state.serverPort}/api/resume-state`)).json();
+      const saved = data && data.saved;
+      if (state.currentTrack || !saved || !saved.track || !saved.track.title) return;
+      const queue = Array.isArray(saved.queue) && saved.queue.length ? saved.queue : [saved.track];
+      let index = Number.isInteger(saved.queueIndex) ? saved.queueIndex : -1;
+      if (!(index >= 0 && index < queue.length && isSameTrack(queue[index], saved.track))) {
+        index = queue.findIndex(t => isSameTrack(t, saved.track));
+      }
+      const track = index >= 0 ? queue[index] : saved.track;
+      const pos = data.pos;
+      const position = pos && (pos.id === (track.id || '') || pos.title === track.title) ? Number(pos.position) || 0 : 0;
+      state.queue = queue;
+      state.queueIndex = index;
+      state._resumeAt = { position, token: state.loadToken + 1 };
+      await playTrack(track, state.queue, index, saved.context || null);
+    } catch (_) {
+      // No saved song or a bad file: start empty as before.
+    } finally {
+      resumeRestoring = false;
+    }
   }
 
   function removeQueueTracks(indices) {
@@ -29168,6 +29284,7 @@ function bindCoverHoldZoom(wrapEl) {
   const runDeferredStartup = () => {
     if (runDeferredStartup._ran) return;
     runDeferredStartup._ran = true;
+    restoreResumeState();
     loadPlugins();
     fetchPersonalVibe();
     loadCustomThemes();

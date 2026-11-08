@@ -6080,6 +6080,7 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/offline-delete',
   '/api/clear-offline-library',
   '/api/save-custom-lyrics',
+  '/api/resume-state',
   '/api/encode',
   '/api/yandex-import'
 ]);
@@ -6987,6 +6988,35 @@ async function handleLyricsOptions(res, title, artist, duration) {
   for (const opt of options) opt.synced = /\[\d{1,3}:\d{2}/.test(opt.lyrics);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ success: true, options }));
+}
+
+// What was playing when Riff closed, so the next start can pick it up: resume.json holds the
+// song and the queue (written when they change), resume-pos.json the position (written every few
+// seconds while playing, so it is small).
+const RESUME_PATH = path.join(DATA_DIR, 'resume.json');
+const RESUME_POS_PATH = path.join(DATA_DIR, 'resume-pos.json');
+
+async function handleResumeState(req, res) {
+  if (req.method === 'GET') {
+    const read = (p) => fs.promises.readFile(p, 'utf-8').then(JSON.parse).catch(() => null);
+    const [saved, pos] = await Promise.all([read(RESUME_PATH), read(RESUME_POS_PATH)]);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ success: true, saved, pos }));
+  }
+  let body = '';
+  req.on('data', chunk => { if (res.writableEnded) return; body += chunk; if (body.length > MAX_BODY_BYTES) { body = ''; req.removeAllListeners('data'); req.removeAllListeners('end'); res.writeHead(413, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, error: 'payload too large' })); req.resume(); } });
+  req.on('end', async () => {
+    try {
+      const data = JSON.parse(body);
+      const target = data && data.kind === 'position' ? RESUME_POS_PATH : RESUME_PATH;
+      await fs.promises.writeFile(target, JSON.stringify(data), 'utf-8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'bad resume state' }));
+    }
+  });
 }
 
 async function handleSaveCustomLyrics(req, res, title, artist) {
@@ -10219,6 +10249,10 @@ async function requestHandler(req, res) {
   if (parsedUrl.pathname === '/api/audio-proxy') {
     const targetUrl = parsedUrl.query.url || '';
     return handleAudioProxy(req, res, targetUrl);
+  }
+
+  if (parsedUrl.pathname === '/api/resume-state' && (req.method === 'GET' || req.method === 'POST')) {
+    return handleResumeState(req, res);
   }
 
   if (parsedUrl.pathname === '/api/save-custom-lyrics' && req.method === 'POST') {
