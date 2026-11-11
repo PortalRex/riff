@@ -798,7 +798,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     toolsReady: false,
     isMuted: localStorage.getItem('riff_muted') === '1',
     volume: savedVolume,
-    isRepeat: localStorage.getItem('riff_repeat') === '1',
+    isRepeat: localStorage.getItem('riff_repeat') === '1', // repeat the song
+    isRepeatAll: localStorage.getItem('riff_repeat') === 'all', // repeat the playlist, album or queue
     isShuffle: localStorage.getItem('riff_shuffle') === '1',
     isAutoRemix: false,
     myWaveActive: false,
@@ -1196,6 +1197,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const br = (typeof brightness === 'number' ? brightness : 20) / 100;
 
     if (mode === 'light') {
+      if (document.body) document.body.classList.remove('pure-black');
       const LB = (v) => Math.max(0, Math.min(100, Math.round(v + (br - 0.5) * 24)));
       if (isMonochrome) {
         const monoPriL = Math.round(11 + br * 45);
@@ -1320,6 +1322,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         setToken('--md-sys-color-on-surface-variant', '#c4c6d0');
         setToken('--md-sys-color-outline', '#8e9099');
         setToken('--md-sys-color-outline-variant', '#282a33');
+      }
+      // Pure black (Settings > Appearance): black background and panels; raised parts stay just
+      // above black so they can still be told apart.
+      const pureBlack = localStorage.getItem('riff_pure_black') === '1';
+      if (document.body) document.body.classList.toggle('pure-black', pureBlack);
+      if (pureBlack) {
+        setToken('--md-sys-color-background', '#000000');
+        setToken('--md-sys-color-surface', '#000000');
+        setToken('--md-sys-color-surface-dim', '#000000');
+        setToken('--md-sys-color-surface-container-lowest', '#000000');
+        setToken('--md-sys-color-surface-container-low', '#000000');
+        setToken('--md-sys-color-surface-container', '#0a0a0a');
+        setToken('--md-sys-color-surface-container-high', '#141414');
+        setToken('--md-sys-color-surface-container-highest', '#1c1c1c');
+        setToken('--md-sys-color-surface-bright', '#262626');
       }
     }
   }
@@ -4556,7 +4573,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (context !== 'album') currentAlbumPlayRunId++;
     state._streamRecoverCount = 0;
-    if (context === 'album' || context === 'playlist' || (track && track.platform === 'local')) {
+    // A list of the user's own (an album, a playlist, the liked songs, an artist's songs) ends any
+    // autoplay or radio queue, so repeat applies to that list.
+    if (['album', 'playlist', 'favorites', 'liked', 'artist'].includes(context) || (track && track.platform === 'local')) {
       state.isRadioQueue = false;
     }
     crossfadeTriggered = false;
@@ -8580,7 +8599,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function maybePrepareAutoplay() {
-    if (!autoplayEnabled() || state.isRadioQueue || state.isRepeat) return;
+    if (!autoplayEnabled() || state.isRadioQueue || state.isRepeat || state.isRepeatAll) return;
     if (!state.currentTrack || !Array.isArray(state.queue) || state.queue.length === 0) return;
     // Shuffle only autoplays when there is no other song to shuffle to (see playNext).
     const nothingElse = state.queue.every((t, i) => i === state.queueIndex || !t || isTrackBlocked(t) || isArtistBlocked(t.artist));
@@ -8634,13 +8653,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
 
-    if (!state.isRadioQueue && !state.isShuffle && state.queueIndex + 1 >= state.queue.length && autoplayEnabled()) {
+    if (!state.isRadioQueue && !state.isShuffle && !state.isRepeatAll && state.queueIndex + 1 >= state.queue.length && autoplayEnabled()) {
       if (await startAutoplay()) return;
     }
 
     // Shuffle with nothing else to pick from replayed the same song; autoplay similar songs
     // instead, as an unshuffled queue does at its end. Repeat still repeats.
-    if (state.isShuffle && !state.isRadioQueue && !state.isRepeat && autoplayEnabled()
+    if (state.isShuffle && !state.isRadioQueue && !state.isRepeat && !state.isRepeatAll && autoplayEnabled()
         && state.queue.every((t, i) => i === state.queueIndex || !t || isTrackBlocked(t) || isArtistBlocked(t.artist))) {
       if (await startAutoplay()) return;
     }
@@ -8665,6 +8684,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
       if (state.queue.length === 0) return;
+      // Every song of the shuffled queue has played: repeat off autoplays similar songs or stops;
+      // repeat all shuffles the queue again (nextShuffledIndex).
+      if (nextIdx < 0 && !provider && !state.isRepeatAll && !state.isRadioQueue
+          && !state.queue.some((t, i) => i > state.queueIndex && t && !isTrackBlocked(t) && !isArtistBlocked(t.artist))) {
+        if (autoplayEnabled() && await startAutoplay()) return;
+        if (state._isNaturalEnding) { stopAtQueueEnd(); return; }
+      }
       if (nextIdx < 0 && !provider) nextIdx = nextShuffledIndex();
       if (nextIdx < 0) {
         const eligible = state.queue.map((track, index) => index)
@@ -8693,6 +8719,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           });
           return;
         }
+        // The end of the queue: repeat all starts it again, repeat off stops when the last song ends.
+        if (!state.isRepeatAll && state._isNaturalEnding && !state.isRadioQueue) { stopAtQueueEnd(); return; }
         nextIdx = 0;
       }
       const candidate = state.queue[nextIdx];
@@ -8710,6 +8738,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (state.myWaveActive && state.queueIndex >= state.queue.length - 3 && typeof extendMyWaveQueue === 'function') {
       extendMyWaveQueue();
     }
+  }
+
+  // The last song ended with repeat off: stay on it, paused at the start.
+  function stopAtQueueEnd() {
+    try { el.nativeAudio.pause(); el.nativeAudio.currentTime = 0; } catch (_) {}
+    state.isPlaying = false;
+    document.body.classList.remove('is-playing');
+    updatePlayPauseButton(false, false);
+    sendStateToServer();
   }
 
   function playPrev() {
@@ -15445,12 +15482,30 @@ function bindCoverHoldZoom(wrapEl) {
     });
   }
 
+  // Repeat cycles off -> repeat all (the playlist, album or queue) -> repeat one (the song).
+  const REPEAT_TITLES = { off: 'Repeat', all: 'Repeat all', one: 'Repeat one' };
+  function getRepeatMode() {
+    return state.isRepeat ? 'one' : (state.isRepeatAll ? 'all' : 'off');
+  }
+  function setRepeatMode(mode) {
+    if (!REPEAT_TITLES[mode]) mode = 'off';
+    state.isRepeat = mode === 'one';
+    state.isRepeatAll = mode === 'all';
+    localStorage.setItem('riff_repeat', mode === 'one' ? '1' : (mode === 'all' ? 'all' : '0'));
+    if (el.btnRepeat) {
+      el.btnRepeat.classList.toggle('active', mode !== 'off');
+      el.btnRepeat.classList.toggle('repeat-one', mode === 'one');
+      el.btnRepeat.title = REPEAT_TITLES[mode];
+    }
+    if (state._autoplayPromise) { state._autoplayPromise = null; state._autoplayKey = ''; }
+    maybePrepareAutoplay();
+  }
+  window.getRepeatMode = getRepeatMode;
+  window.setRepeatMode = setRepeatMode;
   if (el.btnRepeat) {
-    el.btnRepeat.classList.toggle('active', state.isRepeat);
+    setRepeatMode(getRepeatMode());
     el.btnRepeat.addEventListener('click', () => {
-      state.isRepeat = !state.isRepeat;
-      localStorage.setItem('riff_repeat', state.isRepeat ? '1' : '0');
-      el.btnRepeat.classList.toggle('active', state.isRepeat);
+      setRepeatMode({ off: 'all', all: 'one', one: 'off' }[getRepeatMode()]);
     });
   }
 
@@ -16351,6 +16406,17 @@ function bindCoverHoldZoom(wrapEl) {
     };
     el.sliderBrightness.addEventListener('input', onBrightnessChange);
     el.sliderBrightness.addEventListener('change', onBrightnessChange);
+  }
+
+  const btnPureBlack = document.getElementById('btn-pure-black');
+  if (btnPureBlack) {
+    btnPureBlack.classList.toggle('active', localStorage.getItem('riff_pure_black') === '1');
+    btnPureBlack.addEventListener('click', () => {
+      const on = !btnPureBlack.classList.contains('active');
+      btnPureBlack.classList.toggle('active', on);
+      localStorage.setItem('riff_pure_black', on ? '1' : '0');
+      updateThemeFromState();
+    });
   }
 
   if (el.sliderScale) {
@@ -19286,7 +19352,11 @@ function bindCoverHoldZoom(wrapEl) {
         if (typeof command.on !== 'boolean' || command.on !== state.isShuffle) window.toggleShuffle();
         break;
       case 'repeat':
-        if (typeof command.on !== 'boolean' || command.on !== state.isRepeat) window.toggleRepeat();
+        // mode 'off' | 'all' | 'one' sets it; on true/false turns repeat all on or repeat off; none cycles.
+        if (typeof command.mode === 'string') window.setRepeatMode(command.mode);
+        else if (typeof command.on === 'boolean') {
+          if (command.on !== (window.getRepeatMode() !== 'off')) window.setRepeatMode(command.on ? 'all' : 'off');
+        } else window.toggleRepeat();
         break;
       case 'like': {
         const track = command.track ? remoteTrack(command.track) : state.currentTrack;
@@ -19492,7 +19562,8 @@ function bindCoverHoldZoom(wrapEl) {
       volume: Math.round(state.volume * 100),
       muted: !!state.isMuted,
       shuffle: !!state.isShuffle,
-      repeat: !!state.isRepeat,
+      repeat: !!(state.isRepeat || state.isRepeatAll),
+      repeatMode: state.isRepeat ? 'one' : (state.isRepeatAll ? 'all' : 'off'),
       queueIndex: state.queueIndex,
       queueLength: state.queue.length,
       queueStart,

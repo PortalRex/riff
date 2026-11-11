@@ -2995,6 +2995,28 @@ body.m3-cover-on .artwork-wrapper {
   background: var(--md-sys-color-surface-container-high);
   opacity: 0.85;
 }
+/* Repeat one: a small "1" badge on the button's top-right corner. */
+#btn-repeat { position: relative; overflow: visible; }
+#btn-repeat.repeat-one::before {
+  content: '1';
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--md-sys-color-on-primary);
+  color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 1.5px var(--md-sys-color-primary);
+  font-size: 9.5px;
+  font-weight: 800;
+  line-height: 1;
+  font-family: var(--font-family);
+  pointer-events: none;
+}
 #btn-shuffle:hover,
 #btn-repeat:hover {
   background: var(--md-sys-color-surface-container-highest);
@@ -8297,6 +8319,9 @@ body.perf .home-hero-track { transition: none; }
 .home-ambient { position: absolute; inset: -60px; z-index: 0; overflow: hidden; pointer-events: none; }
 .home-ambient-layer { position: absolute; inset: -25%; filter: blur(42px) saturate(1.6) !important; opacity: 0; transition: opacity 700ms ease; will-change: opacity; pointer-events: none; }
 .home-ambient-layer.on { opacity: 0.85; }
+/* Pure black (Settings > Appearance): no colored glow behind the page either. */
+body.pure-black .home-ambient-layer,
+body.pure-black .bg-mesh-layer { display: none !important; }
 #my-wave-ambient-light { display: none !important; }
 body.perf .home-ambient-layer { filter: none; opacity: 0.3; }
 #section-jump-back { display: none !important; }
