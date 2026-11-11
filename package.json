@@ -1,6 +1,6 @@
 {
   "name": "riff",
-  "version": "44.1.1",
+  "version": "0.7.0",
   "main": "src/main/main.js",
   "bin": {
     "riff": "src/main/cli.js"

@@ -11,10 +11,10 @@
       mkRiff = pkgs:
         pkgs.buildNpmPackage rec {
           pname = "riff";
-          version = "44.1.1";
+          version = "0.7.0";
           src = self;
 
-          npmDepsHash = "sha256-eIBXB9u4dI8mcZ1pt4VRWT9U+EcXuGsVAeVwnGYGFmw=";
+          npmDepsHash = "sha256-Z8JgaVaIR6YCmcYDrhdtAkTThslEEmOdRD+cEn6S0u4=";
 
           ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
           forceGitDeps = true;
@@ -40,11 +40,11 @@
               runHook preInstall
 
               mkdir -p ${appDir}
-              for f in *; do cp -r "$f" ${appDir}/; done
+              cp -r src assets package.json node_modules ${appDir}/
 
               mkdir -p $out/bin
               makeWrapper ${pkgs.electron}/bin/electron $out/bin/riff \
-                --add-flags ${appDir} \
+                --add-flags ${appDir}/package.json \
                 --prefix PATH : ${runtimeDeps}
 
               mkdir -p $out/share/applications
