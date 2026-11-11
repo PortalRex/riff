@@ -1323,8 +1323,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         setToken('--md-sys-color-outline', '#8e9099');
         setToken('--md-sys-color-outline-variant', '#282a33');
       }
-      // Pure black (Settings > Appearance): black background and panels; raised parts stay just
-      // above black so they can still be told apart.
+      // AMOLED black (Settings > Appearance): the page, panels and bars are true black; cards,
+      // buttons and hovers stay just above black so they can still be seen.
       const pureBlack = localStorage.getItem('riff_pure_black') === '1';
       if (document.body) document.body.classList.toggle('pure-black', pureBlack);
       if (pureBlack) {
@@ -1333,8 +1333,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         setToken('--md-sys-color-surface-dim', '#000000');
         setToken('--md-sys-color-surface-container-lowest', '#000000');
         setToken('--md-sys-color-surface-container-low', '#000000');
-        setToken('--md-sys-color-surface-container', '#0a0a0a');
-        setToken('--md-sys-color-surface-container-high', '#141414');
+        setToken('--md-sys-color-surface-container', '#000000');
+        setToken('--md-sys-color-surface-container-high', '#121212');
         setToken('--md-sys-color-surface-container-highest', '#1c1c1c');
         setToken('--md-sys-color-surface-bright', '#262626');
       }

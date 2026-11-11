@@ -8319,9 +8319,26 @@ body.perf .home-hero-track { transition: none; }
 .home-ambient { position: absolute; inset: -60px; z-index: 0; overflow: hidden; pointer-events: none; }
 .home-ambient-layer { position: absolute; inset: -25%; filter: blur(42px) saturate(1.6) !important; opacity: 0; transition: opacity 700ms ease; will-change: opacity; pointer-events: none; }
 .home-ambient-layer.on { opacity: 0.85; }
-/* Pure black (Settings > Appearance): no colored glow behind the page either. */
+/* AMOLED black (Settings > Appearance): no colored glow behind the page either. */
 body.pure-black .home-ambient-layer,
 body.pure-black .bg-mesh-layer { display: none !important; }
+/* The sidebar, player bar and panels are drawn a little lighter than the page; with AMOLED black
+   they are true black as well, and the side panels keep a hairline edge. A cover or video
+   background keeps its see-through panels. */
+body.pure-black:not(.cover-bg-on):not(.has-video-bg) {
+  --page-solid: #000000;
+  --page-bg: #000000;
+  --panel-bg: #000000;
+  --bar-editor-bg: #000000;
+}
+body.pure-black:not(.cover-bg-on):not(.has-video-bg) .right-panel:not(.hidden),
+body.pure-black:not(.cover-bg-on):not(.has-video-bg) #np-queue-panel.np-queue-panel.docked {
+  background: #000000 !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07) !important;
+}
+body.pure-black:not(.cover-bg-on):not(.has-video-bg) .search-box {
+  background: var(--md-sys-color-surface-container-high) !important;
+}
 #my-wave-ambient-light { display: none !important; }
 body.perf .home-ambient-layer { filter: none; opacity: 0.3; }
 #section-jump-back { display: none !important; }
