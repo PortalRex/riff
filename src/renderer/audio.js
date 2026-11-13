@@ -525,10 +525,8 @@
     _applyMasterVolume() {
       if (this.fadeGain && this.ctx) {
         try {
-          if (this.fadeGain.gain.value <= 0.01) {
-            this.fadeGain.gain.cancelScheduledValues(this.ctx.currentTime);
-            this.fadeGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
-          }
+          // Bring a faded-out output back up with a short ramp: a jump to full level clicks.
+          if (this.fadeGain.gain.value <= 0.01 && !this._fadingOut) this.rampFadeGain(1, 0.03);
         } catch (_) {}
       }
       const vol = this.isMuted ? 0 : elementVolume(Number.isFinite(this.volume) ? this.volume : 0.85);
@@ -552,6 +550,37 @@
         s.reverb !== 0 || s.distortion !== 0 || s.volume !== 1.0 || s.echo !== 0 || eqMod || eqBandsMod;
     }
 
+
+    // Moves the output gain to `target` over about `seconds`. Every start, stop and song change
+    // goes through this, because cutting a waveform mid-swing is heard as a pop.
+    rampFadeGain(target, seconds = 0.03) {
+      if (!this.fadeGain || !this.ctx) return;
+      try {
+        const g = this.fadeGain.gain;
+        const t = this.ctx.currentTime;
+        this._fadingOut = false;
+        g.cancelScheduledValues(t);
+        g.setValueAtTime(g.value, t);
+        g.linearRampToValueAtTime(target, t + Math.max(0.005, seconds));
+      } catch (_) {}
+    }
+
+    // Fades the song out over its last `seconds` (equal-power curve), for the crossfade setting.
+    fadeOutOver(seconds) {
+      if (!this.fadeGain || !this.ctx) return;
+      try {
+        const g = this.fadeGain.gain;
+        const t = this.ctx.currentTime;
+        const from = g.value;
+        const curve = new Float32Array(64);
+        for (let i = 0; i < curve.length; i++) {
+          curve[i] = from * Math.cos((i / (curve.length - 1)) * Math.PI * 0.5);
+        }
+        g.cancelScheduledValues(t);
+        g.setValueCurveAtTime(curve, t, Math.max(0.05, seconds));
+        this._fadingOut = true;
+      } catch (_) {}
+    }
 
     fadeOut(durationSec = 0.25) {
       if (this.masterGain && this.ctx) {

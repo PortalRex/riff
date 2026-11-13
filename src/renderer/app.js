@@ -6542,46 +6542,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  let cfTailAudio = null;
-  let cfTailTimer = null;
-  function stopCrossfadeTail() {
-    if (cfTailTimer) { clearInterval(cfTailTimer); cfTailTimer = null; }
-    if (cfTailAudio) {
-      try { cfTailAudio.pause(); cfTailAudio.removeAttribute('src'); cfTailAudio.load(); } catch (_) {}
-    }
-  }
-  function startCrossfadeTailFromCurrent(fadeSec) {
-    if (!el.nativeAudio || !el.nativeAudio.src || el.nativeAudio.paused) return;
-    const src = el.nativeAudio.src;
-    if (src.startsWith('blob:')) return;
-    stopCrossfadeTail();
-    if (!cfTailAudio) {
-      cfTailAudio = new Audio();
-      cfTailAudio.crossOrigin = 'anonymous';
-    }
-    const startVol = state.isMuted ? 0 : Math.max(0, Math.min(1, window.riffVolume.elementVolume(state.volume) * (state.audioSettings?.volume || 1)));
-    if (startVol <= 0.01) return;
-    try {
-      cfTailAudio.src = src;
-      cfTailAudio.playbackRate = el.nativeAudio.playbackRate || 1;
-      cfTailAudio.currentTime = el.nativeAudio.currentTime || 0;
-      cfTailAudio.volume = startVol;
-      if (currentAudioOutputDeviceId && currentAudioOutputDeviceId !== 'default' && typeof cfTailAudio.setSinkId === 'function') {
-        cfTailAudio.setSinkId(currentAudioOutputDeviceId).catch(() => {});
-      }
-      cfTailAudio.play().catch(() => {});
-      const t0 = performance.now();
-      const durMs = Math.max(500, fadeSec * 1000);
-      cfTailTimer = setInterval(() => {
-        const p = Math.min(1, (performance.now() - t0) / durMs);
-        cfTailAudio.volume = Math.max(0, startVol * Math.cos(p * Math.PI * 0.5));
-        if (p >= 1) stopCrossfadeTail();
-      }, 40);
-    } catch (_) {
-      stopCrossfadeTail();
-    }
-  }
-
   function cleanTrackId(id) {
     return String(id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
   }
@@ -6661,7 +6621,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     state._skipRecordedFor = null;
 
-    if (el.nativeAudio) {
+    // Stopping a playing song at full level pops. Fade the output down now and stop the song
+    // just before the new one is loaded (below), so the rest of this setup still runs at once.
+    const fadeSwitch = !!(el.nativeAudio && !el.nativeAudio.paused && audioEngine && audioEngine.fadeGain && audioEngine.ctx && audioEngine.ctx.state === 'running');
+    if (fadeSwitch) audioEngine.rampFadeGain(0, 0.025);
+    if (el.nativeAudio && !fadeSwitch) {
       try {
         if (!el.nativeAudio.paused) el.nativeAudio.pause();
         el.nativeAudio.currentTime = 0;
@@ -6681,7 +6645,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     initAudioContext();
     el.nativeAudio.preload = 'auto';
 
-    try { if (el.nativeAudio && !el.nativeAudio.paused) el.nativeAudio.pause(); } catch (_) {}
+    if (!fadeSwitch) {
+      try { if (el.nativeAudio && !el.nativeAudio.paused) el.nativeAudio.pause(); } catch (_) {}
+    }
 
     if (hlsInstance) {
       try { hlsInstance.destroy(); } catch (e) {}
@@ -6858,6 +6824,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     loadSyncedLyrics(track.title, track.artist, currentToken);
+
+    if (fadeSwitch) {
+      await new Promise(r => setTimeout(r, 35));
+      if (currentToken !== state.loadToken) return;
+      try {
+        if (!el.nativeAudio.paused) el.nativeAudio.pause();
+        el.nativeAudio.currentTime = 0;
+      } catch (_) {}
+    }
 
     try {
       if ((track.isCached && track.id) || isStaticTikTokTrack(track) || (track.id && cachedTrackIds.has(cleanTrackId(track.id)))) {
@@ -11818,7 +11793,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function pauseSmooth() {
     saveLastPlaybackState();
-    stopCrossfadeTail();
     state.isLoadingTrack = false;
     const curToken = ++smoothFadeToken;
     isPauseFading = true;
@@ -11907,11 +11881,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (audioEngine && audioEngine.fadeGain && audioEngine.ctx) {
-      try {
-        const ct = audioEngine.ctx.currentTime;
-        audioEngine.fadeGain.gain.cancelScheduledValues(ct);
-        audioEngine.fadeGain.gain.setValueAtTime(1, ct);
-      } catch (_) {}
+      audioEngine.rampFadeGain(1, 0.04);
     }
 
     if (el.nativeAudio) {
@@ -12968,6 +12938,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     el.nativeAudio.addEventListener('seeked', () => {
+      if (crossfadeTriggered && !state.isLoadingTrack && audioEngine && audioEngine._fadingOut) {
+        crossfadeTriggered = false;
+        crossfadeFadeInPending = false;
+        if (!el.nativeAudio.paused) audioEngine.rampFadeGain(1, 0.04);
+        else audioEngine._fadingOut = false;
+      }
       lastKnownAudioTime = el.nativeAudio.currentTime || 0;
       lastAudioTimePerf = performance.now();
       updateMediaPositionState();
@@ -13016,14 +12992,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const X = parseInt(localStorage.getItem('riff_crossfade') || '0', 10);
       if (!state.isLoadingTrack && state.isPlaying && X > 0 && !crossfadeTriggered && !state.isRepeat && dur > Math.max(X * 2, 20) && cur >= dur - X && (!audioEngine || !audioEngine.isLiveStream(el.nativeAudio))) {
-        crossfadeTriggered = true;
-        crossfadeFadeInPending = true;
-        startCrossfadeTailFromCurrent(X);
-        state._isNaturalEnding = true;
-        try {
-          playNext();
-        } finally {
-          state._isNaturalEnding = false;
+        // Fade the song out over what is left of it; 'ended' then starts the next song, which
+        // fades in. (Playing a second copy of the ending song beside it cut both off and popped.)
+        const realDur = Number.isFinite(el.nativeAudio.duration) ? el.nativeAudio.duration : 0;
+        const left = realDur - cur;
+        if (audioEngine && audioEngine.fadeOutOver && left > 0.2 && left <= X + 0.5) {
+          crossfadeTriggered = true;
+          crossfadeFadeInPending = true;
+          audioEngine.fadeOutOver(left);
         }
       }
 
