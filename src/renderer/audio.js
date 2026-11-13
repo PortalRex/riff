@@ -137,8 +137,8 @@
       if (this._attachedElement !== audioElement) {
         this._attachedElement = audioElement;
         audioElement.addEventListener('play', () => this.resumeAudioContext());
-        audioElement.addEventListener('pause', () => this.suspendAudioContextDebounced(5000));
-        audioElement.addEventListener('ended', () => this.suspendAudioContextDebounced(5000));
+        audioElement.addEventListener('pause', () => this.suspendAudioContextDebounced());
+        audioElement.addEventListener('ended', () => this.suspendAudioContextDebounced());
       }
 
       if (!this.graphInitialized) {
@@ -265,7 +265,7 @@
       }
 
       this.applySettings();
-      if (audioElement.paused) this.suspendAudioContextDebounced(5000);
+      if (audioElement.paused) this.suspendAudioContextDebounced();
     }
 
 
@@ -631,7 +631,9 @@
       this._analyserConnected = !!enabled;
     }
 
-    suspendAudioContextDebounced(delayMs = 5000) {
+    // Closing the sound device stream soon after a pause made the next play pop on devices that
+    // click when a stream opens, so it stays open for two minutes of pause.
+    suspendAudioContextDebounced(delayMs = 120000) {
       if (this._suspendTimer) clearTimeout(this._suspendTimer);
       this._suspendTimer = setTimeout(() => {
         this._suspendTimer = null;

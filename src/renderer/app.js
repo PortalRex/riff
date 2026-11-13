@@ -12856,7 +12856,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       updateMediaPositionState();
       if (audioEngine) {
-        if (audioEngine.suspendAudioContextDebounced) audioEngine.suspendAudioContextDebounced(5000);
+        if (audioEngine.suspendAudioContextDebounced) audioEngine.suspendAudioContextDebounced();
         if (audioEngine.setAnalyserEnabled) audioEngine.setAnalyserEnabled(false);
       }
       if (typeof applyM3Cover === 'function') applyM3Cover();
@@ -12891,7 +12891,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
       if (audioEngine) {
-        if (audioEngine.suspendAudioContextDebounced) audioEngine.suspendAudioContextDebounced(5000);
+        if (audioEngine.suspendAudioContextDebounced) audioEngine.suspendAudioContextDebounced();
         if (audioEngine.setAnalyserEnabled) audioEngine.setAnalyserEnabled(false);
       }
       if (syncState && syncState.active) {
@@ -12899,6 +12899,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
       if (state.isRepeat) {
+        crossfadeTriggered = false; // the end fade runs again on every loop
         el.nativeAudio.currentTime = 0;
         playSmooth();
       } else {
@@ -13000,15 +13001,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (audioEngine && audioEngine._hold && el.nativeAudio && !el.nativeAudio.paused && cur > 0.25) audioEngine.releaseHold(0.06);
 
       const X = parseInt(localStorage.getItem('riff_crossfade') || '0', 10);
-      if (!state.isLoadingTrack && state.isPlaying && X > 0 && !crossfadeTriggered && !state.isRepeat && dur > Math.max(X * 2, 20) && cur >= dur - X && (!audioEngine || !audioEngine.isLiveStream(el.nativeAudio))) {
-        // Fade the song out over what is left of it; 'ended' then starts the next song, which
-        // fades in. (Playing a second copy of the ending song beside it cut both off and popped.)
-        const realDur = Number.isFinite(el.nativeAudio.duration) ? el.nativeAudio.duration : 0;
-        const left = realDur - cur;
-        if (audioEngine && audioEngine.fadeOutOver && left > 0.2 && left <= X + 0.5) {
+      // Fade every song out at its very end: many files stop mid-sound, and the jump to silence
+      // pops. With crossfade on the fade is that long and the next song fades in to match.
+      // (Playing a second copy of the ending song for the crossfade cut both off and popped.)
+      {
+        const audio = el.nativeAudio;
+        const realDur = Number.isFinite(audio.duration) ? audio.duration : 0;
+        const left = realDur > 0 ? (realDur - cur) / (audio.playbackRate || 1) : 0;
+        const useCrossfade = X > 0 && !state.isRepeat && realDur > Math.max(X * 2, 20);
+        const fadeLen = useCrossfade ? X : 0.3;
+        if (!state.isLoadingTrack && state.isPlaying && !audio.paused && !audio.seeking && !crossfadeTriggered &&
+            realDur > 3 && left > 0.03 && left <= fadeLen + 0.4 &&
+            audioEngine && audioEngine.fadeOutOver && !audioEngine.isLiveStream(audio)) {
           crossfadeTriggered = true;
-          crossfadeFadeInPending = true;
-          audioEngine.fadeOutOver(left);
+          crossfadeFadeInPending = useCrossfade;
+          audioEngine.fadeOutOver(Math.max(0.02, left - 0.01));
         }
       }
 
