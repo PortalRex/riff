@@ -526,7 +526,7 @@
       if (this.fadeGain && this.ctx) {
         try {
           // Bring a faded-out output back up with a short ramp: a jump to full level clicks.
-          if (this.fadeGain.gain.value <= 0.01 && !this._fadingOut) this.rampFadeGain(1, 0.03);
+          if (this.fadeGain.gain.value <= 0.01 && !this._fadingOut && !this._hold) this.rampFadeGain(1, 0.03);
         } catch (_) {}
       }
       const vol = this.isMuted ? 0 : elementVolume(Number.isFinite(this.volume) ? this.volume : 0.85);
@@ -563,6 +563,26 @@
         g.setValueAtTime(g.value, t);
         g.linearRampToValueAtTime(target, t + Math.max(0.005, seconds));
       } catch (_) {}
+    }
+
+    // Keeps the output silent until the player's audio is actually flowing (releaseHold, on
+    // 'playing'). A song can arrive well after play() is called; a fade-in started at play() is
+    // over by then and the first samples come in at full level, which pops.
+    holdForStart(cutNow) {
+      this._hold = true;
+      if (cutNow && this.fadeGain && this.ctx) {
+        try {
+          this._fadingOut = false;
+          this.fadeGain.gain.cancelScheduledValues(this.ctx.currentTime);
+          this.fadeGain.gain.setValueAtTime(0, this.ctx.currentTime);
+        } catch (_) {}
+      }
+    }
+
+    releaseHold(seconds = 0.06) {
+      if (!this._hold) return;
+      this._hold = false;
+      this.rampFadeGain(1, seconds);
     }
 
     // Fades the song out over its last `seconds` (equal-power curve), for the crossfade setting.
@@ -615,6 +635,12 @@
       if (this._suspendTimer) clearTimeout(this._suspendTimer);
       this._suspendTimer = setTimeout(() => {
         this._suspendTimer = null;
+        // Not while the next song is still loading: stopping and restarting the device stream
+        // between songs pops on many devices. Check again later instead.
+        if (this._attachedElement && this._attachedElement.paused && window.riffIsLoadingTrack && window.riffIsLoadingTrack()) {
+          this.suspendAudioContextDebounced(delayMs);
+          return;
+        }
         if (this.ctx && this.ctx.state === 'running') {
           this.ctx.suspend().catch(() => {});
         }

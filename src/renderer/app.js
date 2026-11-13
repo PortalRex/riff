@@ -3931,6 +3931,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const audioEngine = new window.RiffAudioEngine();
   window.audioEngine = audioEngine;
+  window.riffIsLoadingTrack = () => !!state.isLoadingTrack;
   let hlsInstance = null;
   animationFrameId = null;
 
@@ -6625,6 +6626,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // just before the new one is loaded (below), so the rest of this setup still runs at once.
     const fadeSwitch = !!(el.nativeAudio && !el.nativeAudio.paused && audioEngine && audioEngine.fadeGain && audioEngine.ctx && audioEngine.ctx.state === 'running');
     if (fadeSwitch) audioEngine.rampFadeGain(0, 0.025);
+    if (audioEngine && audioEngine.holdForStart) audioEngine.holdForStart(!fadeSwitch);
     if (el.nativeAudio && !fadeSwitch) {
       try {
         if (!el.nativeAudio.paused) el.nativeAudio.pause();
@@ -11880,8 +11882,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       audioEngine.ctx.resume().catch(() => {});
     }
 
+    // Coming back from silence (a pause or a new song): stay silent until the audio flows, then
+    // fade in ('playing' handler). Already audible: just make sure the level is up.
     if (audioEngine && audioEngine.fadeGain && audioEngine.ctx) {
-      audioEngine.rampFadeGain(1, 0.04);
+      if (el.nativeAudio && el.nativeAudio.paused) audioEngine.holdForStart(true);
+      else if (audioEngine.fadeGain.gain.value <= 0.01) audioEngine.holdForStart(false);
+      else if (!audioEngine._hold) audioEngine.rampFadeGain(1, 0.04);
     }
 
     if (el.nativeAudio) {
@@ -12729,6 +12735,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     el.nativeAudio.addEventListener('playing', () => {
+      if (audioEngine && audioEngine._hold) audioEngine.releaseHold(0.06);
       state.isLoadingTrack = false;
       clearPlaybackStallTimer();
       state.isPlaying = true;
@@ -12989,6 +12996,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const cur = (el.nativeAudio && Number.isFinite(el.nativeAudio.currentTime)) ? el.nativeAudio.currentTime : 0;
       const dur = getReliableTrackDuration();
+      // Safety net if 'playing' was missed: never stay silent once the song is clearly running.
+      if (audioEngine && audioEngine._hold && el.nativeAudio && !el.nativeAudio.paused && cur > 0.25) audioEngine.releaseHold(0.06);
 
       const X = parseInt(localStorage.getItem('riff_crossfade') || '0', 10);
       if (!state.isLoadingTrack && state.isPlaying && X > 0 && !crossfadeTriggered && !state.isRepeat && dur > Math.max(X * 2, 20) && cur >= dur - X && (!audioEngine || !audioEngine.isLiveStream(el.nativeAudio))) {
@@ -34645,9 +34654,10 @@ function bindCoverHoldZoom(wrapEl) {
           }
         }
         if (!ab || ab.byteLength === 0) return;
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        // An offline context only decodes: a normal AudioContext opens (and closes) a stream on the
+        // sound device every time, which some devices answer with a pop right after a song change.
+        const ctx = new OfflineAudioContext(1, 1, 44100);
         const audioBuffer = await ctx.decodeAudioData(ab.slice(0)).catch(() => null);
-        ctx.close().catch(() => {});
         if (!audioBuffer) return;
 
         const channelData = audioBuffer.getChannelData(0);
@@ -35414,7 +35424,7 @@ function bindCoverHoldZoom(wrapEl) {
 
         if (downloadAbort?.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-        const decodeCtx = audioEngine.ctx || new (window.AudioContext || window.webkitAudioContext)();
+        const decodeCtx = audioEngine.ctx || new OfflineAudioContext(1, 1, 44100);
         const decodedBuffer = await new Promise((resolve, reject) => {
           decodeCtx.decodeAudioData(arrayBuffer.slice(0), resolve, reject);
         });
