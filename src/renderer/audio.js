@@ -132,6 +132,11 @@
       } else {
         const AC = window.AudioContext || window.webkitAudioContext;
         this.ctx = new AC({ latencyHint: 'playback' });
+        // When the sound device stream started (see warmUp).
+        this._runningSince = this.ctx.state === 'running' ? performance.now() : 0;
+        this.ctx.addEventListener('statechange', () => {
+          this._runningSince = this.ctx.state === 'running' ? performance.now() : 0;
+        });
       }
 
       if (this._attachedElement !== audioElement) {
@@ -647,6 +652,25 @@
           this.ctx.suspend().catch(() => {});
         }
       }, delayMs);
+    }
+
+    // True while the device stream is stopped or has only just started.
+    needsWarmUp(ms = 300) {
+      if (!this.ctx) return false;
+      return this.ctx.state !== 'running' || !this._runningSince || performance.now() - this._runningSince < ms;
+    }
+
+    // Starts the device stream and lets it run silent for a moment before music goes in. Bluetooth
+    // headphones (and some other devices) pop when sound arrives right as their stream wakes up.
+    async warmUp(ms = 300) {
+      if (!this.ctx) return;
+      if (this._suspendTimer) { clearTimeout(this._suspendTimer); this._suspendTimer = null; }
+      if (this.ctx.state !== 'running') {
+        try { await this.ctx.resume(); } catch (_) {}
+      }
+      if (this.ctx.state === 'running' && !this._runningSince) this._runningSince = performance.now();
+      const wait = ms - (performance.now() - (this._runningSince || performance.now()));
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
     }
 
     resumeAudioContext() {

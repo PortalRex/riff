@@ -11890,6 +11890,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       else if (!audioEngine._hold) audioEngine.rampFadeGain(1, 0.04);
     }
 
+    // First play after the device stream was stopped (Riff just opened, or a long pause): let the
+    // stream run silent for a moment before the song starts.
+    if (el.nativeAudio && el.nativeAudio.paused && audioEngine && audioEngine.needsWarmUp && audioEngine.needsWarmUp()) {
+      await audioEngine.warmUp();
+      if (curToken !== smoothFadeToken) return;
+    }
+
     if (el.nativeAudio) {
       try {
         const playPromise = el.nativeAudio.play();
